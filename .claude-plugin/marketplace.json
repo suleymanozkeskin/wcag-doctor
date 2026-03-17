@@ -1,0 +1,22 @@
+{
+  "name": "wcag-doctor",
+  "owner": {
+    "name": "Suleyman Ozkeskin",
+    "email": "suleymanozkeskin@gmail.com"
+  },
+  "metadata": {
+    "description": "WCAG 2.1 color contrast compliance checker for frontend projects",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "wcag-doctor",
+      "description": "WCAG 2.1 color contrast compliance checker. Audits design system CSS custom properties and scans React/Next.js components for contrast violations against AA and AAA thresholds. Use when checking contrast, accessibility, WCAG compliance, or reviewing color tokens.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skill/wcag-doctor"
+      ]
+    }
+  ]
+}

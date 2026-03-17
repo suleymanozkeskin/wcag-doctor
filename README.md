@@ -41,9 +41,11 @@ This tool ships as a [Claude skill](https://docs.anthropic.com/en/docs/agents-an
 
 ### Claude Code
 
-```bash
-git clone https://github.com/suleymanozkeskin/wcag-doctor.git /tmp/wcag-doctor
-cp -r /tmp/wcag-doctor/skill/wcag-doctor ~/.claude/skills/wcag-doctor
+In Claude Code, run:
+
+```
+/plugin marketplace add suleymanozkeskin/wcag-doctor
+/plugin install wcag-doctor@wcag-doctor
 ```
 
 ### Claude.ai

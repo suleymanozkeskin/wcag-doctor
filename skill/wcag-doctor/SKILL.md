@@ -23,6 +23,8 @@ cargo install --git https://github.com/suleymanozkeskin/wcag-doctor.git
 
 ## Instructions
 
+Always use `--json` for output — it gives the full structured data without terminal truncation. The table output is for human use only and will be cut off on large projects.
+
 ### Step 1: Locate the project
 
 Identify the frontend project root. The tool auto-detects:
@@ -37,23 +39,17 @@ If auto-detection fails, paths can be specified with `--css` and `--tailwind-con
 Start with `--system` mode. This checks all semantic color pairs defined in CSS custom properties (e.g. `--primary` / `--primary-foreground`) for both light and dark themes.
 
 ```bash
-wcag-doctor --system --css path/to/globals.css
+wcag-doctor --system --css path/to/globals.css --json
 ```
 
 This is the highest-value check. It catches design system-level issues that affect every component using those tokens.
 
-Expected output: A table showing each foreground/background pair, its contrast ratio, and whether it passes AAA, AA, or fails. Exit code 1 if any pair fails the minimum level.
-
 ### Step 3: Run component scanning
 
-For component-level analysis, scan individual files or entire directories:
+For component-level analysis, scan entire directories:
 
 ```bash
-# Single file
-wcag-doctor --file path/to/component.tsx --css path/to/globals.css
-
-# Full directory scan (includes cross-file inheritance analysis)
-wcag-doctor --dir path/to/src/components --css path/to/globals.css --tailwind-config path/to/tailwind.config.ts
+wcag-doctor --dir path/to/src/components --css path/to/globals.css --tailwind-config path/to/tailwind.config.ts --json
 ```
 
 The component scanner:
@@ -63,9 +59,50 @@ The component scanner:
 - Detects foreground/background pairs on the same element
 - Builds a cross-file component graph to detect inherited background colors
 - Resolves `tsconfig.json` / `jsconfig.json` path aliases such as `@/` and `~/`
-- Scopes propagated text-color extraction to the matched component body instead of scanning the whole file
 
-### Step 4: Interpret results
+### Step 4: Parse JSON results
+
+The JSON output has this structure:
+
+```json
+{
+  "version": "0.1.0",
+  "minimum_level": "AA",
+  "summary": {
+    "total": 52,
+    "pass_aaa": 40,
+    "pass_aa_large": 2,
+    "pass_aa": 8,
+    "fail": 2
+  },
+  "design_system": [
+    {
+      "theme": "light",
+      "foreground": { "name": "--foreground", "hex": "#0f1419" },
+      "background": { "name": "--background", "hex": "#ffffff" },
+      "ratio": 18.51,
+      "level": "AAA",
+      "passes": true
+    }
+  ],
+  "components": [
+    {
+      "file": "src/components/card.tsx",
+      "line": 42,
+      "element": "p",
+      "foreground": { "name": "text-gray-400", "hex": "#9ca3af" },
+      "background": { "name": "bg-white", "hex": "#ffffff" },
+      "ratio": 2.54,
+      "level": "Fail",
+      "passes": false
+    }
+  ]
+}
+```
+
+To extract failures: filter items where `"passes": false`.
+
+### Step 5: Interpret results
 
 For each failing pair, explain:
 1. Which foreground and background colors are involved
@@ -74,15 +111,9 @@ For each failing pair, explain:
 
 Suggest fixes using the project's existing design system tokens when possible. If raw Tailwind colors (e.g. `bg-red-50`, `text-amber-900`) are used, recommend replacing with semantic tokens.
 
-### Step 5: JSON output for CI
+**Note on border failures:** Border colors (`--border` on `--background`) commonly fail the 4.5:1 text threshold. This is expected — borders are non-text UI chrome and only need 3:1 per WCAG SC 1.4.11. Flag these separately and don't count them as real failures.
 
-For CI integration, use `--json` to get structured output:
-
-```bash
-wcag-doctor --system --css path/to/globals.css --json
-```
-
-The JSON includes a summary with pass/fail counts and detailed results per pair.
+**Note on exit codes:** The tool exits with code 1 if any pair fails the minimum level. Border-only failures will still trigger exit code 1. Use `--json` and filter by `passes: false` to distinguish real failures from expected border noise.
 
 ## CLI Reference
 
@@ -129,17 +160,3 @@ OPTIONS:
 - Dynamic/computed runtime classes cannot always be resolved statically
 - Tailwind v4 projects are detected, but the built-in fallback palette is still v3-oriented
 - Static analysis can miss runtime-only theme or state combinations that are not present in source
-
-## Common Issues
-
-### No CSS file found
-If auto-detection fails, specify the path explicitly:
-```bash
-wcag-doctor --system --css src/styles/globals.css
-```
-
-### No pairs detected in component scan
-This means no element had both a foreground and background color class on the same element. Try `--dir` mode which also builds a cross-file component graph to detect inherited color pairs.
-
-### Border contrast failures
-Border colors (--border on --background) commonly fail because borders are UI chrome, not text. These are expected — borders only need 3:1 contrast per WCAG "non-text contrast" (SC 1.4.11), not the 4.5:1 text threshold. Use `--level aa` and assess border failures case by case.

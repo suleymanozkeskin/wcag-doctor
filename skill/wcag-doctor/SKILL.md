@@ -1,19 +1,6 @@
 ---
 name: wcag-doctor
-description: Checks WCAG 2.1 color contrast compliance (AA and AAA) for frontend projects. Audits design system CSS custom properties and scans components for contrast violations. Use when user asks to "check contrast", "audit accessibility", "check WCAG compliance", "find color contrast issues", or reviews CSS/Tailwind color tokens.
-license: MIT
-metadata:
-  author: suleymanozkeskin
-  version: 0.1.0
-  filePattern:
-    - "**/globals.css"
-    - "**/tailwind.config.*"
-    - "**/*.tsx"
-    - "**/*.jsx"
-  bashPattern:
-    - "wcag-doctor"
-    - "contrast"
-    - "accessibility"
+description: WCAG 2.1 color contrast compliance checker for frontend projects. Audits design system CSS custom properties and scans React/Next.js components for contrast violations against AA and AAA thresholds. Use this skill whenever the user mentions contrast, accessibility, WCAG, a11y, color compliance, or asks to audit colors — even if they don't explicitly say "contrast check". Also use when reviewing globals.css, Tailwind color tokens, shadcn themes, or any CSS custom property color system, since these are prime candidates for contrast issues.
 ---
 
 # WCAG Doctor

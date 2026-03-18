@@ -10,7 +10,8 @@ use wcag_doctor::contrast::levels::MinimumLevel;
 use wcag_doctor::report::json::build_json_report;
 use wcag_doctor::report::terminal::{print_component_report, print_design_system_report};
 use wcag_doctor::resolver::css_vars::{
-    extract_css_vars_with_diagnostics, load_css_vars_from_file_with_diagnostics, resolve_var_colors,
+    extract_css_vars_with_diagnostics, find_missing_dark_overrides,
+    load_css_vars_from_file_with_diagnostics, resolve_var_colors,
 };
 use wcag_doctor::resolver::tailwind::{TailwindColorConfig, parse_tailwind_config};
 use wcag_doctor::scanner::component::{ColorPair, Theme, dedup_color_pairs, scan_component};
@@ -174,6 +175,29 @@ fn main() {
     let check_light = matches!(cli.theme, ThemeChoice::Light | ThemeChoice::Both);
     let check_dark = matches!(cli.theme, ThemeChoice::Dark | ThemeChoice::Both);
 
+    // Compute missing dark override warnings
+    let mut warnings: Vec<String> = Vec::new();
+    if check_dark {
+        let missing = find_missing_dark_overrides(&var_map);
+        if !missing.is_empty() {
+            if cli.verbose {
+                eprintln!(
+                    "  {} CSS variables have no dark theme override (light value used in both themes):",
+                    missing.len()
+                );
+                for var in &missing {
+                    eprintln!("    - {var}");
+                }
+            }
+            for var in &missing {
+                warnings.push(format!(
+                    "CSS variable {var} has no dark theme override. \
+                     Light mode value will be used in dark mode, which may cause contrast issues."
+                ));
+            }
+        }
+    }
+
     // Run the requested modes
     let mut design_pairs = Vec::new();
     let mut component_pairs = Vec::new();
@@ -244,7 +268,7 @@ fn main() {
 
     // Output results
     if cli.json {
-        let json = build_json_report(&design_pairs, &component_pairs, cli.level);
+        let json = build_json_report(&design_pairs, &component_pairs, cli.level, &warnings);
         println!("{json}");
     } else {
         if !design_pairs.is_empty() {
@@ -256,6 +280,12 @@ fn main() {
         if design_pairs.is_empty() && component_pairs.is_empty() {
             eprintln!("Nothing to check. Use --system, --file, or --dir to specify what to scan.");
             process::exit(1);
+        }
+        if !warnings.is_empty() {
+            eprintln!(
+                "  Note: {} CSS variable(s) have no dark theme override (use --verbose to list them).",
+                warnings.len()
+            );
         }
     }
 

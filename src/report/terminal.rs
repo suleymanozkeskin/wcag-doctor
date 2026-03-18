@@ -93,13 +93,14 @@ pub fn print_component_report(pairs: &[ColorPair], minimum: MinimumLevel) {
     println!();
 
     println!("{}", format_row(&[
-        Column::left("Location".bold().to_string(), 40),
+        Column::left("Location".bold().to_string(), 36),
+        Column::left("Theme".bold().to_string(), 6),
         Column::left("Foreground".bold().to_string(), 20),
         Column::left("Background".bold().to_string(), 20),
         Column::right("Ratio".bold().to_string(), 8),
         Column::left("Level".bold().to_string(), 10),
     ]));
-    println!("  {}", "─".repeat(102));
+    println!("  {}", "─".repeat(105));
 
     let mut pass_count = 0;
     let mut fail_count = 0;
@@ -118,7 +119,8 @@ pub fn print_component_report(pairs: &[ColorPair], minimum: MinimumLevel) {
         let level_str = format_level(pair.level);
 
         let line = format_row(&[
-            Column::left(truncate(&location, 38), 40),
+            Column::left(truncate(&location, 34), 36),
+            Column::left(pair.theme.clone(), 6),
             Column::left(truncate(&pair.foreground_name, 18), 20),
             Column::left(truncate(&pair.background_name, 18), 20),
             Column::right(ratio_str, 8),
@@ -132,7 +134,7 @@ pub fn print_component_report(pairs: &[ColorPair], minimum: MinimumLevel) {
         }
     }
 
-    println!("  {}", "─".repeat(102));
+    println!("  {}", "─".repeat(105));
     print_summary(pass_count, fail_count, minimum);
 }
 

@@ -35,6 +35,8 @@ pub fn propagate_and_check(
     let mut sorted_files: Vec<_> = graph.keys().collect();
     sorted_files.sort();
 
+    let theme_label = theme.label().to_string();
+
     for file in sorted_files {
         let node = &graph[file];
         for usage in &node.usages {
@@ -70,6 +72,7 @@ pub fn propagate_and_check(
                         &usage.component_name,
                         tw_config,
                         vars,
+                        theme,
                     )
                 });
 
@@ -96,6 +99,7 @@ pub fn propagate_and_check(
                         file: file.to_string_lossy().to_string(),
                         line: usage.line,
                         element: usage.component_name.clone(),
+                        theme: theme_label.clone(),
                     });
                 }
             }
@@ -164,6 +168,7 @@ fn extract_text_colors_for_component(
     component_name: &str,
     tw_config: &TailwindColorConfig,
     vars: &HashMap<String, Rgba>,
+    theme: Theme,
 ) -> Vec<(String, Rgba)> {
     let content = match std::fs::read_to_string(file) {
         Ok(c) => c,
@@ -179,10 +184,10 @@ fn extract_text_colors_for_component(
     if let Some(body) = find_component_body(&module, component_name) {
         return match body {
             ComponentBodyRef::Block(block) => {
-                collect_foreground_colors_from_block(block, &content, tw_config, vars)
+                collect_foreground_colors_from_block(block, &content, tw_config, vars, theme)
             }
             ComponentBodyRef::Expr(expr) => {
-                collect_foreground_colors_from_expr(expr, &content, tw_config, vars)
+                collect_foreground_colors_from_expr(expr, &content, tw_config, vars, theme)
             }
         };
     }
@@ -190,7 +195,7 @@ fn extract_text_colors_for_component(
     // Fallback: couldn't find the named component, walk the full module AST.
     // This covers re-exports, HOCs, and other patterns we can't statically resolve
     // without matching comments or arbitrary strings.
-    collect_foreground_colors_from_module(&module, &content, tw_config, vars)
+    collect_foreground_colors_from_module(&module, &content, tw_config, vars, theme)
 }
 
 enum ComponentBodyRef<'a> {
@@ -326,6 +331,7 @@ fn collect_foreground_colors_from_module(
     source: &str,
     tw_config: &TailwindColorConfig,
     vars: &HashMap<String, Rgba>,
+    theme: Theme,
 ) -> Vec<(String, Rgba)> {
     let mut colors = Vec::new();
 
@@ -334,7 +340,7 @@ fn collect_foreground_colors_from_module(
             ModuleItem::Stmt(Stmt::Decl(Decl::Fn(f))) => {
                 if let Some(body) = &f.function.body {
                     colors.extend(collect_foreground_colors_from_block(
-                        body, source, tw_config, vars,
+                        body, source, tw_config, vars, theme,
                     ));
                 }
             }
@@ -342,21 +348,21 @@ fn collect_foreground_colors_from_module(
                 for decl in &var_decl.decls {
                     if let Some(init) = &decl.init {
                         colors.extend(collect_foreground_colors_from_expr(
-                            init, source, tw_config, vars,
+                            init, source, tw_config, vars, theme,
                         ));
                     }
                 }
             }
             ModuleItem::Stmt(Stmt::Expr(expr)) => {
                 colors.extend(collect_foreground_colors_from_expr(
-                    &expr.expr, source, tw_config, vars,
+                    &expr.expr, source, tw_config, vars, theme,
                 ));
             }
             ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
                 Decl::Fn(f) => {
                     if let Some(body) = &f.function.body {
                         colors.extend(collect_foreground_colors_from_block(
-                            body, source, tw_config, vars,
+                            body, source, tw_config, vars, theme,
                         ));
                     }
                 }
@@ -364,7 +370,7 @@ fn collect_foreground_colors_from_module(
                     for decl in &var_decl.decls {
                         if let Some(init) = &decl.init {
                             colors.extend(collect_foreground_colors_from_expr(
-                                init, source, tw_config, vars,
+                                init, source, tw_config, vars, theme,
                             ));
                         }
                     }
@@ -375,7 +381,7 @@ fn collect_foreground_colors_from_module(
                 if let DefaultDecl::Fn(f) = &export.decl {
                     if let Some(body) = &f.function.body {
                         colors.extend(collect_foreground_colors_from_block(
-                            body, source, tw_config, vars,
+                            body, source, tw_config, vars, theme,
                         ));
                     }
                 }
@@ -386,6 +392,7 @@ fn collect_foreground_colors_from_module(
                     source,
                     tw_config,
                     vars,
+                    theme,
                 ));
             }
             _ => {}

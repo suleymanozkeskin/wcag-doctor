@@ -136,11 +136,34 @@ pub fn extract_css_vars_with_diagnostics(css_content: &str) -> (CssVarMap, Vec<S
 /// - Direct color values (hex, rgb, hsl, bare hsl, named, oklch)
 /// - var(--other) references within the same theme
 /// - hsl(var(--x)) wrapper patterns (unwrap var, parse as bare HSL)
+///
+/// The dark theme inherits from light (matching CSS cascading: `:root` vars
+/// are available in `.dark` context unless overridden).
 pub fn resolve_var_colors(var_map: &CssVarMap) -> ResolvedVarColors {
+    // Dark theme inherits light vars, then overlays dark-specific overrides.
+    let mut dark_with_fallback = var_map.light.clone();
+    for (k, v) in &var_map.dark {
+        dark_with_fallback.insert(k.clone(), v.clone());
+    }
+
     ResolvedVarColors {
         light: resolve_theme(&var_map.light),
-        dark: resolve_theme(&var_map.dark),
+        dark: resolve_theme(&dark_with_fallback),
     }
+}
+
+/// Find CSS variables that exist in the light theme but have no dark override.
+/// These vars will use their light-mode value in dark mode, which may cause
+/// contrast issues if the var was designed for light backgrounds.
+pub fn find_missing_dark_overrides(var_map: &CssVarMap) -> Vec<String> {
+    let mut missing: Vec<String> = var_map
+        .light
+        .keys()
+        .filter(|k| !var_map.dark.contains_key(*k))
+        .cloned()
+        .collect();
+    missing.sort();
+    missing
 }
 
 fn resolve_theme(vars: &HashMap<String, String>) -> HashMap<String, Rgba> {
@@ -655,5 +678,72 @@ mod tests {
         let (map, diagnostics) = extract_css_vars_with_diagnostics(css);
         assert_eq!(map.light.get("--background").unwrap(), "#ffffff");
         assert!(!diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_dark_theme_inherits_light_vars() {
+        let css = r#"
+            :root {
+                --background: 0 0% 100%;
+                --foreground: 0 0% 0%;
+                --accent: #ff6600;
+            }
+            .dark {
+                --background: 0 0% 5%;
+            }
+        "#;
+        let map = extract_css_vars(css);
+        let resolved = resolve_var_colors(&map);
+
+        // Dark theme should have all three vars: --background overridden,
+        // --foreground and --accent inherited from light.
+        assert!(resolved.dark.contains_key("--background"));
+        assert!(resolved.dark.contains_key("--foreground"));
+        assert!(resolved.dark.contains_key("--accent"));
+
+        // --background should be the dark override, not the light value
+        let dark_bg = resolved.dark.get("--background").unwrap();
+        assert_ne!((dark_bg.r, dark_bg.g, dark_bg.b), (255, 255, 255));
+
+        // --foreground should be inherited from light (black)
+        let dark_fg = resolved.dark.get("--foreground").unwrap();
+        assert_eq!((dark_fg.r, dark_fg.g, dark_fg.b), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_find_missing_dark_overrides() {
+        let css = r#"
+            :root {
+                --background: #ffffff;
+                --foreground: #000000;
+                --accent: #ff6600;
+            }
+            .dark {
+                --background: #0a0a0a;
+            }
+        "#;
+        let map = extract_css_vars(css);
+        let missing = find_missing_dark_overrides(&map);
+
+        // --foreground and --accent have no dark override
+        assert!(missing.contains(&"--foreground".to_string()));
+        assert!(missing.contains(&"--accent".to_string()));
+        // --background has a dark override, should NOT be listed
+        assert!(!missing.contains(&"--background".to_string()));
+    }
+
+    #[test]
+    fn test_find_missing_dark_overrides_empty_when_all_covered() {
+        let css = r#"
+            :root {
+                --background: #ffffff;
+            }
+            .dark {
+                --background: #0a0a0a;
+            }
+        "#;
+        let map = extract_css_vars(css);
+        let missing = find_missing_dark_overrides(&map);
+        assert!(missing.is_empty());
     }
 }

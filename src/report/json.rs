@@ -11,6 +11,8 @@ pub struct JsonReport {
     pub summary: JsonSummary,
     pub design_system: Vec<JsonDesignSystemResult>,
     pub components: Vec<JsonComponentResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -37,6 +39,7 @@ pub struct JsonComponentResult {
     pub file: String,
     pub line: usize,
     pub element: String,
+    pub theme: String,
     pub foreground: JsonColorInfo,
     pub background: JsonColorInfo,
     pub ratio: f64,
@@ -55,6 +58,7 @@ pub fn build_json_report(
     design_pairs: &[DesignSystemPair],
     component_pairs: &[ColorPair],
     minimum: MinimumLevel,
+    warnings: &[String],
 ) -> String {
     let mut pass_aaa = 0;
     let mut pass_aa_large = 0;
@@ -103,6 +107,7 @@ pub fn build_json_report(
                 file: p.file.clone(),
                 line: p.line,
                 element: p.element.clone(),
+                theme: p.theme.clone(),
                 foreground: JsonColorInfo {
                     name: p.foreground_name.clone(),
                     hex: p.foreground_color.to_hex(),
@@ -134,6 +139,7 @@ pub fn build_json_report(
         },
         design_system: ds_results,
         components: comp_results,
+        warnings: warnings.to_vec(),
     };
 
     serde_json::to_string_pretty(&report).unwrap_or_else(|e| {
@@ -159,13 +165,36 @@ mod tests {
             file: "file.tsx".to_string(),
             line: 1,
             element: "p".to_string(),
+            theme: "light".to_string(),
         }];
 
-        let report = build_json_report(&[], &components, MinimumLevel::AaLarge);
+        let report = build_json_report(&[], &components, MinimumLevel::AaLarge, &[]);
         let value: serde_json::Value = serde_json::from_str(&report).unwrap();
 
         assert_eq!(value["summary"]["pass_aa_large"], 1);
         assert_eq!(value["summary"]["fail"], 0);
         assert_eq!(value["components"][0]["passes"], true);
+        assert_eq!(value["components"][0]["theme"], "light");
+    }
+
+    #[test]
+    fn json_report_includes_warnings() {
+        let warnings = vec![
+            "CSS variable --custom-color has no dark theme override".to_string(),
+        ];
+
+        let report = build_json_report(&[], &[], MinimumLevel::Aa, &warnings);
+        let value: serde_json::Value = serde_json::from_str(&report).unwrap();
+
+        assert_eq!(value["warnings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn json_report_omits_empty_warnings() {
+        let report = build_json_report(&[], &[], MinimumLevel::Aa, &[]);
+        let value: serde_json::Value = serde_json::from_str(&report).unwrap();
+
+        // warnings field should be absent when empty (skip_serializing_if)
+        assert!(value.get("warnings").is_none());
     }
 }

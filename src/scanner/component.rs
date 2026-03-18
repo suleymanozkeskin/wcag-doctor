@@ -25,6 +25,7 @@ pub struct ColorPair {
     pub file: String,
     pub line: usize,
     pub element: String,
+    pub theme: String,
 }
 
 /// Colors found on a single JSX element.
@@ -70,6 +71,7 @@ pub fn scan_component(
         &file_str,
         &mut pairs,
         &no_inherited_bg,
+        theme,
     );
 
     pairs
@@ -81,8 +83,47 @@ pub enum Theme {
     Dark,
 }
 
+impl Theme {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+}
+
+/// Theme context derived from Tailwind variant prefixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeContext {
+    /// No dark:/light: prefix — applies in both themes.
+    Base,
+    /// Has dark: prefix — applies only in dark theme.
+    DarkOnly,
+    /// Has light: prefix — applies only in light theme.
+    LightOnly,
+}
+
+/// Parse variant prefixes and determine theme context.
+/// Returns (theme_context, base_class_without_prefixes).
+fn parse_variant_context(class: &str) -> (ThemeContext, &str) {
+    let base = strip_variant_prefixes(class);
+    if base.len() == class.len() {
+        return (ThemeContext::Base, base);
+    }
+    // The prefix portion is everything before the base class.
+    // E.g., for "sm:dark:hover:bg-red-500" → prefix = "sm:dark:hover:"
+    let prefix = &class[..class.len() - base.len()];
+    if prefix.split(':').any(|p| p == "dark") {
+        (ThemeContext::DarkOnly, base)
+    } else if prefix.split(':').any(|p| p == "light") {
+        (ThemeContext::LightOnly, base)
+    } else {
+        (ThemeContext::Base, base)
+    }
+}
+
 /// Deduplicate component findings while preserving their original order.
-/// Uses the reporting identity tuple `(file, line, element, foreground, background)`.
+/// Uses the reporting identity tuple `(file, line, element, foreground, background, theme)`.
 pub fn dedup_color_pairs(pairs: Vec<ColorPair>) -> Vec<ColorPair> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
@@ -94,6 +135,7 @@ pub fn dedup_color_pairs(pairs: Vec<ColorPair>) -> Vec<ColorPair> {
             pair.element.clone(),
             pair.foreground_name.clone(),
             pair.background_name.clone(),
+            pair.theme.clone(),
         );
         if seen.insert(key) {
             deduped.push(pair);
@@ -109,10 +151,11 @@ pub fn collect_foreground_colors_from_block(
     source: &str,
     tw_config: &TailwindColorConfig,
     vars: &HashMap<String, Rgba>,
+    theme: Theme,
 ) -> Vec<(String, Rgba)> {
     let mut colors = Vec::new();
     let mut seen = HashSet::new();
-    collect_foregrounds_block(block, source, tw_config, vars, &mut colors, &mut seen);
+    collect_foregrounds_block(block, source, tw_config, vars, &mut colors, &mut seen, theme);
     colors
 }
 
@@ -122,10 +165,11 @@ pub fn collect_foreground_colors_from_expr(
     source: &str,
     tw_config: &TailwindColorConfig,
     vars: &HashMap<String, Rgba>,
+    theme: Theme,
 ) -> Vec<(String, Rgba)> {
     let mut colors = Vec::new();
     let mut seen = HashSet::new();
-    collect_foregrounds_expr(expr, source, tw_config, vars, &mut colors, &mut seen);
+    collect_foregrounds_expr(expr, source, tw_config, vars, &mut colors, &mut seen, theme);
     colors
 }
 
@@ -142,9 +186,10 @@ fn collect_jsx_pairs(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     for item in &module.body {
-        walk_module_item(item, source, tw_config, vars, file, pairs, inherited_bg);
+        walk_module_item(item, source, tw_config, vars, file, pairs, inherited_bg, theme);
     }
 }
 
@@ -156,13 +201,14 @@ fn walk_module_item(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     match item {
         ModuleItem::Stmt(stmt) => {
-            walk_stmt(stmt, source, tw_config, vars, file, pairs, inherited_bg)
+            walk_stmt(stmt, source, tw_config, vars, file, pairs, inherited_bg, theme)
         }
         ModuleItem::ModuleDecl(decl) => {
-            walk_module_decl(decl, source, tw_config, vars, file, pairs, inherited_bg)
+            walk_module_decl(decl, source, tw_config, vars, file, pairs, inherited_bg, theme)
         }
     }
 }
@@ -175,20 +221,21 @@ fn walk_module_decl(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     match decl {
         ModuleDecl::ExportDecl(export) => {
-            walk_decl(&export.decl, source, tw_config, vars, file, pairs, inherited_bg)
+            walk_decl(&export.decl, source, tw_config, vars, file, pairs, inherited_bg, theme)
         }
         ModuleDecl::ExportDefaultDecl(export) => {
             if let DefaultDecl::Fn(f) = &export.decl {
                 if let Some(body) = &f.function.body {
-                    walk_block_stmt(body, source, tw_config, vars, file, pairs, inherited_bg);
+                    walk_block_stmt(body, source, tw_config, vars, file, pairs, inherited_bg, theme);
                 }
             }
         }
         ModuleDecl::ExportDefaultExpr(export) => {
-            walk_expr(&export.expr, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_expr(&export.expr, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         _ => {}
     }
@@ -202,17 +249,18 @@ fn walk_decl(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     match decl {
         Decl::Fn(f) => {
             if let Some(body) = &f.function.body {
-                walk_block_stmt(body, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_block_stmt(body, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
         }
         Decl::Var(var_decl) => {
             for decl in &var_decl.decls {
                 if let Some(init) = &decl.init {
-                    walk_expr(init, source, tw_config, vars, file, pairs, inherited_bg);
+                    walk_expr(init, source, tw_config, vars, file, pairs, inherited_bg, theme);
                 }
             }
         }
@@ -228,18 +276,19 @@ fn walk_stmt(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     match stmt {
         Stmt::Block(block) => {
-            walk_block_stmt(block, source, tw_config, vars, file, pairs, inherited_bg)
+            walk_block_stmt(block, source, tw_config, vars, file, pairs, inherited_bg, theme)
         }
         Stmt::Return(ret) => {
             if let Some(arg) = &ret.arg {
-                walk_expr(arg, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_expr(arg, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
         }
         Stmt::Expr(expr) => {
-            walk_expr(&expr.expr, source, tw_config, vars, file, pairs, inherited_bg)
+            walk_expr(&expr.expr, source, tw_config, vars, file, pairs, inherited_bg, theme)
         }
         Stmt::If(if_stmt) => {
             walk_stmt(
@@ -250,62 +299,63 @@ fn walk_stmt(
                 file,
                 pairs,
                 inherited_bg,
+                theme,
             );
             if let Some(alt) = &if_stmt.alt {
-                walk_stmt(alt, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_stmt(alt, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
         }
         Stmt::For(for_stmt) => {
             if let Some(init) = &for_stmt.init {
-                walk_var_decl_or_expr(init, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_var_decl_or_expr(init, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
             if let Some(test) = &for_stmt.test {
-                walk_expr(test, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_expr(test, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
             if let Some(update) = &for_stmt.update {
-                walk_expr(update, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_expr(update, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
-            walk_stmt(&for_stmt.body, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_stmt(&for_stmt.body, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         Stmt::ForIn(for_in_stmt) => {
-            walk_var_decl_or_pat(&for_in_stmt.left, source, tw_config, vars, file, pairs, inherited_bg);
-            walk_expr(&for_in_stmt.right, source, tw_config, vars, file, pairs, inherited_bg);
-            walk_stmt(&for_in_stmt.body, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_var_decl_or_pat(&for_in_stmt.left, source, tw_config, vars, file, pairs, inherited_bg, theme);
+            walk_expr(&for_in_stmt.right, source, tw_config, vars, file, pairs, inherited_bg, theme);
+            walk_stmt(&for_in_stmt.body, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         Stmt::ForOf(for_of_stmt) => {
-            walk_var_decl_or_pat(&for_of_stmt.left, source, tw_config, vars, file, pairs, inherited_bg);
-            walk_expr(&for_of_stmt.right, source, tw_config, vars, file, pairs, inherited_bg);
-            walk_stmt(&for_of_stmt.body, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_var_decl_or_pat(&for_of_stmt.left, source, tw_config, vars, file, pairs, inherited_bg, theme);
+            walk_expr(&for_of_stmt.right, source, tw_config, vars, file, pairs, inherited_bg, theme);
+            walk_stmt(&for_of_stmt.body, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         Stmt::While(while_stmt) => {
-            walk_expr(&while_stmt.test, source, tw_config, vars, file, pairs, inherited_bg);
-            walk_stmt(&while_stmt.body, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_expr(&while_stmt.test, source, tw_config, vars, file, pairs, inherited_bg, theme);
+            walk_stmt(&while_stmt.body, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         Stmt::DoWhile(do_while_stmt) => {
-            walk_stmt(&do_while_stmt.body, source, tw_config, vars, file, pairs, inherited_bg);
-            walk_expr(&do_while_stmt.test, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_stmt(&do_while_stmt.body, source, tw_config, vars, file, pairs, inherited_bg, theme);
+            walk_expr(&do_while_stmt.test, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         Stmt::Switch(switch_stmt) => {
-            walk_expr(&switch_stmt.discriminant, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_expr(&switch_stmt.discriminant, source, tw_config, vars, file, pairs, inherited_bg, theme);
             for case in &switch_stmt.cases {
                 if let Some(test) = &case.test {
-                    walk_expr(test, source, tw_config, vars, file, pairs, inherited_bg);
+                    walk_expr(test, source, tw_config, vars, file, pairs, inherited_bg, theme);
                 }
                 for stmt in &case.cons {
-                    walk_stmt(stmt, source, tw_config, vars, file, pairs, inherited_bg);
+                    walk_stmt(stmt, source, tw_config, vars, file, pairs, inherited_bg, theme);
                 }
             }
         }
         Stmt::Try(try_stmt) => {
-            walk_block_stmt(&try_stmt.block, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_block_stmt(&try_stmt.block, source, tw_config, vars, file, pairs, inherited_bg, theme);
             if let Some(handler) = &try_stmt.handler {
-                walk_block_stmt(&handler.body, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_block_stmt(&handler.body, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
             if let Some(finalizer) = &try_stmt.finalizer {
-                walk_block_stmt(finalizer, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_block_stmt(finalizer, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
         }
-        Stmt::Decl(decl) => walk_decl(decl, source, tw_config, vars, file, pairs, inherited_bg),
+        Stmt::Decl(decl) => walk_decl(decl, source, tw_config, vars, file, pairs, inherited_bg, theme),
         _ => {}
     }
 }
@@ -318,13 +368,14 @@ fn walk_var_decl_or_expr(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     match init {
         VarDeclOrExpr::VarDecl(var_decl) => {
-            walk_decl(&Decl::Var(var_decl.clone()), source, tw_config, vars, file, pairs, inherited_bg);
+            walk_decl(&Decl::Var(var_decl.clone()), source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         VarDeclOrExpr::Expr(expr) => {
-            walk_expr(expr, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_expr(expr, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
     }
 }
@@ -337,10 +388,11 @@ fn walk_var_decl_or_pat(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     match left {
         ForHead::VarDecl(var_decl) => {
-            walk_decl(&Decl::Var(var_decl.clone()), source, tw_config, vars, file, pairs, inherited_bg);
+            walk_decl(&Decl::Var(var_decl.clone()), source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         ForHead::UsingDecl(_) => {}
         ForHead::Pat(_) => {}
@@ -355,9 +407,10 @@ fn walk_block_stmt(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     for stmt in &block.stmts {
-        walk_stmt(stmt, source, tw_config, vars, file, pairs, inherited_bg);
+        walk_stmt(stmt, source, tw_config, vars, file, pairs, inherited_bg, theme);
     }
 }
 
@@ -368,9 +421,10 @@ fn collect_foregrounds_block(
     vars: &HashMap<String, Rgba>,
     colors: &mut Vec<(String, Rgba)>,
     seen: &mut HashSet<String>,
+    theme: Theme,
 ) {
     for stmt in &block.stmts {
-        collect_foregrounds_stmt(stmt, source, tw_config, vars, colors, seen);
+        collect_foregrounds_stmt(stmt, source, tw_config, vars, colors, seen, theme);
     }
 }
 
@@ -381,82 +435,83 @@ fn collect_foregrounds_stmt(
     vars: &HashMap<String, Rgba>,
     colors: &mut Vec<(String, Rgba)>,
     seen: &mut HashSet<String>,
+    theme: Theme,
 ) {
     match stmt {
-        Stmt::Block(block) => collect_foregrounds_block(block, source, tw_config, vars, colors, seen),
+        Stmt::Block(block) => collect_foregrounds_block(block, source, tw_config, vars, colors, seen, theme),
         Stmt::Return(ret) => {
             if let Some(arg) = &ret.arg {
-                collect_foregrounds_expr(arg, source, tw_config, vars, colors, seen);
+                collect_foregrounds_expr(arg, source, tw_config, vars, colors, seen, theme);
             }
         }
         Stmt::Expr(expr) => {
-            collect_foregrounds_expr(&expr.expr, source, tw_config, vars, colors, seen)
+            collect_foregrounds_expr(&expr.expr, source, tw_config, vars, colors, seen, theme)
         }
         Stmt::If(if_stmt) => {
-            collect_foregrounds_stmt(&if_stmt.cons, source, tw_config, vars, colors, seen);
+            collect_foregrounds_stmt(&if_stmt.cons, source, tw_config, vars, colors, seen, theme);
             if let Some(alt) = &if_stmt.alt {
-                collect_foregrounds_stmt(alt, source, tw_config, vars, colors, seen);
+                collect_foregrounds_stmt(alt, source, tw_config, vars, colors, seen, theme);
             }
         }
         Stmt::For(for_stmt) => {
             if let Some(init) = &for_stmt.init {
-                collect_foregrounds_var_decl_or_expr(init, source, tw_config, vars, colors, seen);
+                collect_foregrounds_var_decl_or_expr(init, source, tw_config, vars, colors, seen, theme);
             }
             if let Some(test) = &for_stmt.test {
-                collect_foregrounds_expr(test, source, tw_config, vars, colors, seen);
+                collect_foregrounds_expr(test, source, tw_config, vars, colors, seen, theme);
             }
             if let Some(update) = &for_stmt.update {
-                collect_foregrounds_expr(update, source, tw_config, vars, colors, seen);
+                collect_foregrounds_expr(update, source, tw_config, vars, colors, seen, theme);
             }
-            collect_foregrounds_stmt(&for_stmt.body, source, tw_config, vars, colors, seen);
+            collect_foregrounds_stmt(&for_stmt.body, source, tw_config, vars, colors, seen, theme);
         }
         Stmt::ForIn(for_in_stmt) => {
-            collect_foregrounds_for_head(&for_in_stmt.left, source, tw_config, vars, colors, seen);
-            collect_foregrounds_expr(&for_in_stmt.right, source, tw_config, vars, colors, seen);
-            collect_foregrounds_stmt(&for_in_stmt.body, source, tw_config, vars, colors, seen);
+            collect_foregrounds_for_head(&for_in_stmt.left, source, tw_config, vars, colors, seen, theme);
+            collect_foregrounds_expr(&for_in_stmt.right, source, tw_config, vars, colors, seen, theme);
+            collect_foregrounds_stmt(&for_in_stmt.body, source, tw_config, vars, colors, seen, theme);
         }
         Stmt::ForOf(for_of_stmt) => {
-            collect_foregrounds_for_head(&for_of_stmt.left, source, tw_config, vars, colors, seen);
-            collect_foregrounds_expr(&for_of_stmt.right, source, tw_config, vars, colors, seen);
-            collect_foregrounds_stmt(&for_of_stmt.body, source, tw_config, vars, colors, seen);
+            collect_foregrounds_for_head(&for_of_stmt.left, source, tw_config, vars, colors, seen, theme);
+            collect_foregrounds_expr(&for_of_stmt.right, source, tw_config, vars, colors, seen, theme);
+            collect_foregrounds_stmt(&for_of_stmt.body, source, tw_config, vars, colors, seen, theme);
         }
         Stmt::While(while_stmt) => {
-            collect_foregrounds_expr(&while_stmt.test, source, tw_config, vars, colors, seen);
-            collect_foregrounds_stmt(&while_stmt.body, source, tw_config, vars, colors, seen);
+            collect_foregrounds_expr(&while_stmt.test, source, tw_config, vars, colors, seen, theme);
+            collect_foregrounds_stmt(&while_stmt.body, source, tw_config, vars, colors, seen, theme);
         }
         Stmt::DoWhile(do_while_stmt) => {
-            collect_foregrounds_stmt(&do_while_stmt.body, source, tw_config, vars, colors, seen);
-            collect_foregrounds_expr(&do_while_stmt.test, source, tw_config, vars, colors, seen);
+            collect_foregrounds_stmt(&do_while_stmt.body, source, tw_config, vars, colors, seen, theme);
+            collect_foregrounds_expr(&do_while_stmt.test, source, tw_config, vars, colors, seen, theme);
         }
         Stmt::Switch(switch_stmt) => {
-            collect_foregrounds_expr(&switch_stmt.discriminant, source, tw_config, vars, colors, seen);
+            collect_foregrounds_expr(&switch_stmt.discriminant, source, tw_config, vars, colors, seen, theme);
             for case in &switch_stmt.cases {
                 if let Some(test) = &case.test {
-                    collect_foregrounds_expr(test, source, tw_config, vars, colors, seen);
+                    collect_foregrounds_expr(test, source, tw_config, vars, colors, seen, theme);
                 }
                 for stmt in &case.cons {
-                    collect_foregrounds_stmt(stmt, source, tw_config, vars, colors, seen);
+                    collect_foregrounds_stmt(stmt, source, tw_config, vars, colors, seen, theme);
                 }
             }
         }
         Stmt::Try(try_stmt) => {
-            collect_foregrounds_block(&try_stmt.block, source, tw_config, vars, colors, seen);
+            collect_foregrounds_block(&try_stmt.block, source, tw_config, vars, colors, seen, theme);
             if let Some(handler) = &try_stmt.handler {
-                collect_foregrounds_block(&handler.body, source, tw_config, vars, colors, seen);
+                collect_foregrounds_block(&handler.body, source, tw_config, vars, colors, seen, theme);
             }
             if let Some(finalizer) = &try_stmt.finalizer {
-                collect_foregrounds_block(finalizer, source, tw_config, vars, colors, seen);
+                collect_foregrounds_block(finalizer, source, tw_config, vars, colors, seen, theme);
             }
         }
         Stmt::Decl(Decl::Fn(f)) => {
             if let Some(body) = &f.function.body {
-                collect_foregrounds_block(body, source, tw_config, vars, colors, seen);
+                collect_foregrounds_block(body, source, tw_config, vars, colors, seen, theme);
             }
         }
         Stmt::Decl(Decl::Var(var_decl)) => {
             for decl in &var_decl.decls {
                 if let Some(init) = &decl.init {
-                    collect_foregrounds_expr(init, source, tw_config, vars, colors, seen);
+                    collect_foregrounds_expr(init, source, tw_config, vars, colors, seen, theme);
                 }
             }
         }
@@ -471,17 +526,18 @@ fn collect_foregrounds_var_decl_or_expr(
     vars: &HashMap<String, Rgba>,
     colors: &mut Vec<(String, Rgba)>,
     seen: &mut HashSet<String>,
+    theme: Theme,
 ) {
     match init {
         VarDeclOrExpr::VarDecl(var_decl) => {
             for decl in &var_decl.decls {
                 if let Some(init) = &decl.init {
-                    collect_foregrounds_expr(init, source, tw_config, vars, colors, seen);
+                    collect_foregrounds_expr(init, source, tw_config, vars, colors, seen, theme);
                 }
             }
         }
         VarDeclOrExpr::Expr(expr) => {
-            collect_foregrounds_expr(expr, source, tw_config, vars, colors, seen);
+            collect_foregrounds_expr(expr, source, tw_config, vars, colors, seen, theme);
         }
     }
 }
@@ -493,11 +549,12 @@ fn collect_foregrounds_for_head(
     vars: &HashMap<String, Rgba>,
     colors: &mut Vec<(String, Rgba)>,
     seen: &mut HashSet<String>,
+    theme: Theme,
 ) {
     if let ForHead::VarDecl(var_decl) = head {
         for decl in &var_decl.decls {
             if let Some(init) = &decl.init {
-                collect_foregrounds_expr(init, source, tw_config, vars, colors, seen);
+                collect_foregrounds_expr(init, source, tw_config, vars, colors, seen, theme);
             }
         }
     }
@@ -510,40 +567,41 @@ fn collect_foregrounds_expr(
     vars: &HashMap<String, Rgba>,
     colors: &mut Vec<(String, Rgba)>,
     seen: &mut HashSet<String>,
+    theme: Theme,
 ) {
     match expr {
         Expr::JSXElement(el) => {
-            collect_foregrounds_jsx_element(el, source, tw_config, vars, colors, seen);
+            collect_foregrounds_jsx_element(el, source, tw_config, vars, colors, seen, theme);
         }
         Expr::JSXFragment(frag) => {
             for child in &frag.children {
-                collect_foregrounds_jsx_child(child, source, tw_config, vars, colors, seen);
+                collect_foregrounds_jsx_child(child, source, tw_config, vars, colors, seen, theme);
             }
         }
-        Expr::Paren(p) => collect_foregrounds_expr(&p.expr, source, tw_config, vars, colors, seen),
+        Expr::Paren(p) => collect_foregrounds_expr(&p.expr, source, tw_config, vars, colors, seen, theme),
         Expr::Arrow(arrow) => match &*arrow.body {
             BlockStmtOrExpr::BlockStmt(block) => {
-                collect_foregrounds_block(block, source, tw_config, vars, colors, seen)
+                collect_foregrounds_block(block, source, tw_config, vars, colors, seen, theme)
             }
             BlockStmtOrExpr::Expr(expr) => {
-                collect_foregrounds_expr(expr, source, tw_config, vars, colors, seen)
+                collect_foregrounds_expr(expr, source, tw_config, vars, colors, seen, theme)
             }
         },
         Expr::Call(call) => {
             if let Callee::Expr(callee) = &call.callee {
-                collect_foregrounds_expr(callee, source, tw_config, vars, colors, seen);
+                collect_foregrounds_expr(callee, source, tw_config, vars, colors, seen, theme);
             }
             for arg in &call.args {
-                collect_foregrounds_expr(&arg.expr, source, tw_config, vars, colors, seen);
+                collect_foregrounds_expr(&arg.expr, source, tw_config, vars, colors, seen, theme);
             }
         }
         Expr::Cond(cond) => {
-            collect_foregrounds_expr(&cond.cons, source, tw_config, vars, colors, seen);
-            collect_foregrounds_expr(&cond.alt, source, tw_config, vars, colors, seen);
+            collect_foregrounds_expr(&cond.cons, source, tw_config, vars, colors, seen, theme);
+            collect_foregrounds_expr(&cond.alt, source, tw_config, vars, colors, seen, theme);
         }
         Expr::Bin(bin) => {
-            collect_foregrounds_expr(&bin.left, source, tw_config, vars, colors, seen);
-            collect_foregrounds_expr(&bin.right, source, tw_config, vars, colors, seen);
+            collect_foregrounds_expr(&bin.left, source, tw_config, vars, colors, seen, theme);
+            collect_foregrounds_expr(&bin.right, source, tw_config, vars, colors, seen, theme);
         }
         _ => {}
     }
@@ -556,19 +614,20 @@ fn collect_foregrounds_jsx_child(
     vars: &HashMap<String, Rgba>,
     colors: &mut Vec<(String, Rgba)>,
     seen: &mut HashSet<String>,
+    theme: Theme,
 ) {
     match child {
         JSXElementChild::JSXElement(el) => {
-            collect_foregrounds_jsx_element(el, source, tw_config, vars, colors, seen);
+            collect_foregrounds_jsx_element(el, source, tw_config, vars, colors, seen, theme);
         }
         JSXElementChild::JSXFragment(frag) => {
             for child in &frag.children {
-                collect_foregrounds_jsx_child(child, source, tw_config, vars, colors, seen);
+                collect_foregrounds_jsx_child(child, source, tw_config, vars, colors, seen, theme);
             }
         }
         JSXElementChild::JSXExprContainer(container) => {
             if let JSXExpr::Expr(expr) = &container.expr {
-                collect_foregrounds_expr(expr, source, tw_config, vars, colors, seen);
+                collect_foregrounds_expr(expr, source, tw_config, vars, colors, seen, theme);
             }
         }
         _ => {}
@@ -582,6 +641,7 @@ fn collect_foregrounds_jsx_element(
     vars: &HashMap<String, Rgba>,
     colors: &mut Vec<(String, Rgba)>,
     seen: &mut HashSet<String>,
+    theme: Theme,
 ) {
     let mut elem_colors = ElementColors::default();
 
@@ -592,7 +652,7 @@ fn collect_foregrounds_jsx_element(
                 "className" | "class" => {
                     if let Some(value) = &jsx_attr.value {
                         let class_str = extract_jsx_attr_string(value, source);
-                        extract_colors_from_classes(&class_str, tw_config, vars, &mut elem_colors);
+                        extract_colors_from_classes(&class_str, tw_config, vars, &mut elem_colors, theme);
                     }
                 }
                 "style" => {
@@ -613,7 +673,7 @@ fn collect_foregrounds_jsx_element(
     }
 
     for child in &element.children {
-        collect_foregrounds_jsx_child(child, source, tw_config, vars, colors, seen);
+        collect_foregrounds_jsx_child(child, source, tw_config, vars, colors, seen, theme);
     }
 }
 
@@ -625,42 +685,43 @@ fn walk_expr(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     match expr {
         Expr::JSXElement(el) => {
-            process_jsx_element(el, source, tw_config, vars, file, pairs, inherited_bg);
+            process_jsx_element(el, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         Expr::JSXFragment(frag) => {
             for child in &frag.children {
-                walk_jsx_child(child, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_jsx_child(child, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
         }
         Expr::Paren(p) => {
-            walk_expr(&p.expr, source, tw_config, vars, file, pairs, inherited_bg)
+            walk_expr(&p.expr, source, tw_config, vars, file, pairs, inherited_bg, theme)
         }
         Expr::Arrow(arrow) => match &*arrow.body {
             BlockStmtOrExpr::BlockStmt(block) => {
-                walk_block_stmt(block, source, tw_config, vars, file, pairs, inherited_bg)
+                walk_block_stmt(block, source, tw_config, vars, file, pairs, inherited_bg, theme)
             }
             BlockStmtOrExpr::Expr(expr) => {
-                walk_expr(expr, source, tw_config, vars, file, pairs, inherited_bg)
+                walk_expr(expr, source, tw_config, vars, file, pairs, inherited_bg, theme)
             }
         },
         Expr::Call(call) => {
             if let Callee::Expr(callee) = &call.callee {
-                walk_expr(callee, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_expr(callee, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
             for arg in &call.args {
-                walk_expr(&arg.expr, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_expr(&arg.expr, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
         }
         Expr::Cond(cond) => {
-            walk_expr(&cond.cons, source, tw_config, vars, file, pairs, inherited_bg);
-            walk_expr(&cond.alt, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_expr(&cond.cons, source, tw_config, vars, file, pairs, inherited_bg, theme);
+            walk_expr(&cond.alt, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         Expr::Bin(bin) => {
-            walk_expr(&bin.left, source, tw_config, vars, file, pairs, inherited_bg);
-            walk_expr(&bin.right, source, tw_config, vars, file, pairs, inherited_bg);
+            walk_expr(&bin.left, source, tw_config, vars, file, pairs, inherited_bg, theme);
+            walk_expr(&bin.right, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         _ => {}
     }
@@ -674,19 +735,20 @@ fn walk_jsx_child(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     match child {
         JSXElementChild::JSXElement(el) => {
-            process_jsx_element(el, source, tw_config, vars, file, pairs, inherited_bg);
+            process_jsx_element(el, source, tw_config, vars, file, pairs, inherited_bg, theme);
         }
         JSXElementChild::JSXFragment(frag) => {
             for child in &frag.children {
-                walk_jsx_child(child, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_jsx_child(child, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
         }
         JSXElementChild::JSXExprContainer(container) => {
             if let JSXExpr::Expr(expr) = &container.expr {
-                walk_expr(expr, source, tw_config, vars, file, pairs, inherited_bg);
+                walk_expr(expr, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
         }
         _ => {}
@@ -701,6 +763,7 @@ fn process_jsx_element(
     file: &str,
     pairs: &mut Vec<ColorPair>,
     inherited_bg: &[(String, Rgba)],
+    theme: Theme,
 ) {
     let element_name = jsx_element_name(&element.opening.name);
     let line = byte_offset_to_line(source, element.opening.span.lo.0 as usize);
@@ -724,6 +787,7 @@ fn process_jsx_element(
                             tw_config,
                             vars,
                             &mut elem_colors,
+                            theme,
                         );
                     }
                 }
@@ -755,6 +819,8 @@ fn process_jsx_element(
         inherited_bg
     };
 
+    let theme_label = theme.label().to_string();
+
     for (fg_name, fg_color) in &elem_colors.foregrounds {
         for (bg_name, bg_color) in bg_source {
             let ratio = contrast_ratio(fg_color, bg_color);
@@ -769,37 +835,75 @@ fn process_jsx_element(
                 file: file.to_string(),
                 line: elem_colors.line,
                 element: elem_colors.element_name.clone(),
+                theme: theme_label.clone(),
             });
         }
     }
 
     // Recurse into children with the effective background context
     for child in &element.children {
-        walk_jsx_child(child, source, tw_config, vars, file, pairs, &effective_bg);
+        walk_jsx_child(child, source, tw_config, vars, file, pairs, &effective_bg, theme);
     }
 }
 
+/// Extract colors from Tailwind classes with theme-aware filtering and override.
+///
+/// **Filtering**: `dark:` prefixed classes are excluded in light mode and vice versa.
+///
+/// **Override**: In dark mode, if any `dark:bg-*` class exists, it replaces all
+/// unprefixed `bg-*` classes (matching Tailwind's CSS specificity model where
+/// `.dark &` has higher specificity than the base selector). Same for foreground
+/// classes. In light mode, `light:` prefixed classes override base classes.
 fn extract_colors_from_classes(
     class_str: &str,
     tw_config: &TailwindColorConfig,
     vars: &HashMap<String, Rgba>,
     elem: &mut ElementColors,
+    theme: Theme,
 ) {
+    let mut base_fgs: Vec<(String, Rgba)> = Vec::new();
+    let mut base_bgs: Vec<(String, Rgba)> = Vec::new();
+    let mut override_fgs: Vec<(String, Rgba)> = Vec::new();
+    let mut override_bgs: Vec<(String, Rgba)> = Vec::new();
+
     for class in class_str.split_whitespace() {
-        // Strip dark: or responsive prefixes
-        let base_class = strip_variant_prefixes(class);
+        let (context, base_class) = parse_variant_context(class);
+
+        // Skip classes that don't apply to this theme
+        match (theme, context) {
+            (Theme::Light, ThemeContext::DarkOnly) => continue,
+            (Theme::Dark, ThemeContext::LightOnly) => continue,
+            _ => {}
+        }
 
         if let Some((kind, color_name)) = parse_utility_class(base_class) {
             if let Some(rgba) = resolve_tailwind_color(&color_name, tw_config, vars) {
                 let display_name = base_class.to_string();
+                let is_override = match theme {
+                    Theme::Light => context == ThemeContext::LightOnly,
+                    Theme::Dark => context == ThemeContext::DarkOnly,
+                };
+
                 if kind.is_foreground() {
-                    elem.foregrounds.push((display_name, rgba));
+                    if is_override {
+                        override_fgs.push((display_name, rgba));
+                    } else {
+                        base_fgs.push((display_name, rgba));
+                    }
                 } else if kind.is_background() {
-                    elem.backgrounds.push((display_name, rgba));
+                    if is_override {
+                        override_bgs.push((display_name, rgba));
+                    } else {
+                        base_bgs.push((display_name, rgba));
+                    }
                 }
             }
         }
     }
+
+    // Theme-specific classes override base classes (higher CSS specificity).
+    elem.foregrounds.extend(if !override_fgs.is_empty() { override_fgs } else { base_fgs });
+    elem.backgrounds.extend(if !override_bgs.is_empty() { override_bgs } else { base_bgs });
 }
 
 fn extract_colors_from_inline_style(
@@ -1055,6 +1159,154 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_variant_context() {
+        assert_eq!(
+            parse_variant_context("bg-primary"),
+            (ThemeContext::Base, "bg-primary")
+        );
+        assert_eq!(
+            parse_variant_context("dark:bg-primary"),
+            (ThemeContext::DarkOnly, "bg-primary")
+        );
+        assert_eq!(
+            parse_variant_context("light:text-white"),
+            (ThemeContext::LightOnly, "text-white")
+        );
+        assert_eq!(
+            parse_variant_context("sm:dark:hover:bg-red-500"),
+            (ThemeContext::DarkOnly, "bg-red-500")
+        );
+        assert_eq!(
+            parse_variant_context("hover:bg-blue-500"),
+            (ThemeContext::Base, "bg-blue-500")
+        );
+    }
+
+    #[test]
+    fn test_dark_classes_excluded_in_light_mode() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("component.tsx");
+        let source = r#"
+            export function Demo() {
+                return <div className="bg-white dark:bg-slate-900 text-black dark:text-white" />;
+            }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Light,
+        );
+
+        // In light mode: bg-white + text-black only, dark: classes excluded
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].foreground_name, "text-black");
+        assert_eq!(pairs[0].background_name, "bg-white");
+    }
+
+    #[test]
+    fn test_dark_override_replaces_base_in_dark_mode() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("component.tsx");
+        let source = r#"
+            export function Demo() {
+                return <div className="bg-white dark:bg-slate-900 text-black dark:text-white" />;
+            }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Dark,
+        );
+
+        // In dark mode: dark:bg-slate-900 overrides bg-white, dark:text-white overrides text-black
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].foreground_name, "text-white");
+        assert_eq!(pairs[0].background_name, "bg-slate-900");
+    }
+
+    #[test]
+    fn test_base_classes_used_when_no_dark_override() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("component.tsx");
+        let source = r#"
+            export function Demo() {
+                return <div className="bg-white text-red-500" />;
+            }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        // In dark mode with no dark: override, base classes are used
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Dark,
+        );
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].foreground_name, "text-red-500");
+        assert_eq!(pairs[0].background_name, "bg-white");
+    }
+
+    #[test]
+    fn test_partial_dark_override_fg_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("component.tsx");
+        // Only foreground has dark: override, background does not
+        let source = r#"
+            export function Demo() {
+                return <div className="bg-white text-black dark:text-white" />;
+            }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Dark,
+        );
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].foreground_name, "text-white"); // dark: override
+        assert_eq!(pairs[0].background_name, "bg-white"); // no override, base used
+    }
+
+    #[test]
+    fn test_color_pair_has_theme_field() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("component.tsx");
+        let source = r#"
+            export function Demo() {
+                return <div className="bg-white text-black" />;
+            }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let light_pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Light,
+        );
+        assert_eq!(light_pairs[0].theme, "light");
+
+        let dark_pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Dark,
+        );
+        assert_eq!(dark_pairs[0].theme, "dark");
+    }
+
+    #[test]
     fn test_byte_offset_to_line() {
         let source = "line1\nline2\nline3";
         assert_eq!(byte_offset_to_line(source, 1), 1);
@@ -1148,6 +1400,7 @@ mod tests {
             source,
             &TailwindColorConfig::default(),
             &ResolvedVarColors::default().light,
+            Theme::Light,
         );
 
         let names: Vec<&str> = colors.iter().map(|(name, _)| name.as_str()).collect();
@@ -1169,6 +1422,7 @@ mod tests {
                 file: "page.tsx".to_string(),
                 line: 10,
                 element: "Sidebar".to_string(),
+                theme: "light".to_string(),
             },
             ColorPair {
                 foreground_name: "text-red-500".to_string(),
@@ -1180,6 +1434,7 @@ mod tests {
                 file: "page.tsx".to_string(),
                 line: 10,
                 element: "Sidebar".to_string(),
+                theme: "light".to_string(),
             },
             ColorPair {
                 foreground_name: "text-red-500".to_string(),
@@ -1191,6 +1446,7 @@ mod tests {
                 file: "page.tsx".to_string(),
                 line: 10,
                 element: "Sidebar".to_string(),
+                theme: "light".to_string(),
             },
             ColorPair {
                 foreground_name: "text-red-500".to_string(),
@@ -1202,6 +1458,7 @@ mod tests {
                 file: "page.tsx".to_string(),
                 line: 10,
                 element: "Button".to_string(),
+                theme: "light".to_string(),
             },
         ];
 

@@ -94,7 +94,7 @@ impl Theme {
 
 /// Theme context derived from Tailwind variant prefixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThemeContext {
+pub enum ThemeContext {
     /// No dark:/light: prefix — applies in both themes.
     Base,
     /// Has dark: prefix — applies only in dark theme.
@@ -105,7 +105,7 @@ enum ThemeContext {
 
 /// Parse variant prefixes and determine theme context.
 /// Returns (theme_context, base_class_without_prefixes).
-fn parse_variant_context(class: &str) -> (ThemeContext, &str) {
+pub fn parse_variant_context(class: &str) -> (ThemeContext, &str) {
     let base = strip_variant_prefixes(class);
     if base.len() == class.len() {
         return (ThemeContext::Base, base);
@@ -956,7 +956,7 @@ fn atom_to_string(atom: &swc_atoms::Atom) -> String {
 }
 
 /// Strip Tailwind variant prefixes (e.g. "dark:", "hover:", "sm:", "focus:").
-fn strip_variant_prefixes(class: &str) -> &str {
+pub fn strip_variant_prefixes(class: &str) -> &str {
     match class.rfind(':') {
         Some(idx) => &class[idx + 1..],
         None => class,

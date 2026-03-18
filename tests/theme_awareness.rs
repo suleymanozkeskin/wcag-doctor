@@ -850,3 +850,117 @@ export function Card() {
     assert_eq!(light_components[0]["foreground"]["name"], "text-red-500");
     assert_eq!(light_components[0]["background"]["name"], "bg-white");
 }
+
+// ============================================================================
+// 6. Cross-file propagation with theme variants
+// ============================================================================
+
+#[test]
+fn cross_file_propagation_respects_dark_bg_override() {
+    // Parent wraps child with bg-white dark:bg-slate-900.
+    // In dark mode, child's text should be checked against bg-slate-900, not bg-white.
+    let dir = TempDir::new().unwrap();
+
+    write_file(
+        dir.path(),
+        "globals.css",
+        r#"
+:root {
+    --background: #ffffff;
+}
+"#,
+    );
+
+    write_file(
+        dir.path(),
+        "sidebar.tsx",
+        r#"
+export function Sidebar() {
+    return <p className="text-red-500">hello</p>;
+}
+"#,
+    );
+
+    write_file(
+        dir.path(),
+        "page.tsx",
+        r#"
+import { Sidebar } from "./sidebar";
+
+export function Page() {
+    return (
+        <div className="bg-white dark:bg-slate-900">
+            <Sidebar />
+        </div>
+    );
+}
+"#,
+    );
+
+    // Dark mode: should check text-red-500 against bg-slate-900
+    let dark_args = vec![
+        "--dir".to_string(),
+        dir.path().display().to_string(),
+        "--css".to_string(),
+        dir.path().join("globals.css").display().to_string(),
+        "--json".to_string(),
+        "--theme".to_string(),
+        "dark".to_string(),
+    ];
+
+    let dark_output = run_wcag_doctor(&dark_args);
+    let dark_report: Value = serde_json::from_slice(&dark_output.stdout).unwrap();
+    let dark_components = dark_report["components"].as_array().unwrap();
+
+    // Find the cross-file propagated pair (foreground contains "in sidebar.tsx")
+    let propagated: Vec<&Value> = dark_components.iter()
+        .filter(|c| c["foreground"]["name"].as_str().unwrap().contains("sidebar"))
+        .collect();
+
+    assert!(
+        !propagated.is_empty(),
+        "should find cross-file propagated pair in dark mode"
+    );
+
+    // The background should be bg-slate-900 (dark override), not bg-white
+    for pair in &propagated {
+        let bg_name = pair["background"]["name"].as_str().unwrap();
+        assert!(
+            bg_name.contains("bg-slate-900"),
+            "dark mode propagation should use dark:bg-slate-900, got: {bg_name}"
+        );
+        assert!(
+            !bg_name.contains("bg-white"),
+            "dark mode propagation should NOT use bg-white, got: {bg_name}"
+        );
+    }
+
+    // Light mode: should check text-red-500 against bg-white
+    let light_args = vec![
+        "--dir".to_string(),
+        dir.path().display().to_string(),
+        "--css".to_string(),
+        dir.path().join("globals.css").display().to_string(),
+        "--json".to_string(),
+        "--theme".to_string(),
+        "light".to_string(),
+    ];
+
+    let light_output = run_wcag_doctor(&light_args);
+    let light_report: Value = serde_json::from_slice(&light_output.stdout).unwrap();
+    let light_components = light_report["components"].as_array().unwrap();
+
+    let light_propagated: Vec<&Value> = light_components.iter()
+        .filter(|c| c["foreground"]["name"].as_str().unwrap().contains("sidebar"))
+        .collect();
+
+    assert!(!light_propagated.is_empty());
+
+    for pair in &light_propagated {
+        let bg_name = pair["background"]["name"].as_str().unwrap();
+        assert!(
+            bg_name.contains("bg-white"),
+            "light mode propagation should use bg-white, got: {bg_name}"
+        );
+    }
+}

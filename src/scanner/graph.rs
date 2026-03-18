@@ -570,7 +570,9 @@ fn process_jsx_for_usages(
                             None => class,
                         };
                         if base.starts_with("bg-") {
-                            current_bg_classes.push(base.to_string());
+                            // Store full class with variant prefixes (e.g. "dark:bg-slate-900")
+                            // so propagation can apply theme-aware filtering.
+                            current_bg_classes.push(class.to_string());
                         }
                     }
                 }

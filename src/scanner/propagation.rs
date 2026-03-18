@@ -11,7 +11,8 @@ use crate::resolver::tailwind::{
     TailwindColorConfig, parse_utility_class, resolve_tailwind_color,
 };
 use crate::scanner::component::{
-    ColorPair, Theme, collect_foreground_colors_from_block, collect_foreground_colors_from_expr,
+    ColorPair, Theme, ThemeContext, collect_foreground_colors_from_block,
+    collect_foreground_colors_from_expr, parse_variant_context,
 };
 use crate::scanner::graph::ComponentNode;
 
@@ -40,7 +41,7 @@ pub fn propagate_and_check(
     for file in sorted_files {
         let node = &graph[file];
         for usage in &node.usages {
-            let bg_colors = resolve_bg_classes(&usage.parent_bg_classes, tw_config, vars);
+            let bg_colors = resolve_bg_classes(&usage.parent_bg_classes, tw_config, vars, theme);
 
             if bg_colors.is_empty() {
                 continue;
@@ -137,22 +138,48 @@ fn resolve_reexport_chain<'a>(
     current
 }
 
+/// Resolve background classes with theme-aware filtering and override.
+///
+/// Classes may include variant prefixes (e.g. "dark:bg-slate-900").
+/// In dark mode, `dark:bg-*` overrides unprefixed `bg-*` (matching
+/// Tailwind's CSS specificity). Same symmetry for `light:` in light mode.
 fn resolve_bg_classes(
     classes: &[String],
     tw_config: &TailwindColorConfig,
     vars: &HashMap<String, Rgba>,
+    theme: Theme,
 ) -> Vec<(String, Rgba)> {
-    let mut results = Vec::new();
+    let mut base_bgs: Vec<(String, Rgba)> = Vec::new();
+    let mut override_bgs: Vec<(String, Rgba)> = Vec::new();
+
     for class in classes {
-        if let Some((kind, color_name)) = parse_utility_class(class) {
+        let (context, base_class) = parse_variant_context(class);
+
+        // Skip classes that don't apply to this theme
+        match (theme, context) {
+            (Theme::Light, ThemeContext::DarkOnly) => continue,
+            (Theme::Dark, ThemeContext::LightOnly) => continue,
+            _ => {}
+        }
+
+        if let Some((kind, color_name)) = parse_utility_class(base_class) {
             if kind.is_background() {
                 if let Some(rgba) = resolve_tailwind_color(&color_name, tw_config, vars) {
-                    results.push((class.clone(), rgba));
+                    let is_override = match theme {
+                        Theme::Light => context == ThemeContext::LightOnly,
+                        Theme::Dark => context == ThemeContext::DarkOnly,
+                    };
+                    if is_override {
+                        override_bgs.push((base_class.to_string(), rgba));
+                    } else {
+                        base_bgs.push((base_class.to_string(), rgba));
+                    }
                 }
             }
         }
     }
-    results
+
+    if !override_bgs.is_empty() { override_bgs } else { base_bgs }
 }
 
 /// Extract text-color classes from a specific exported component in a file.

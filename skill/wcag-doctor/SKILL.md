@@ -90,17 +90,23 @@ The JSON output has this structure:
       "file": "src/components/card.tsx",
       "line": 42,
       "element": "p",
+      "theme": "dark",
       "foreground": { "name": "text-gray-400", "hex": "#9ca3af" },
       "background": { "name": "bg-white", "hex": "#ffffff" },
       "ratio": 2.54,
       "level": "Fail",
       "passes": false
     }
+  ],
+  "warnings": [
+    "CSS variable --accent has no dark theme override. Light mode value will be used in dark mode, which may cause contrast issues."
   ]
 }
 ```
 
-To extract failures: filter items where `"passes": false`.
+The `warnings` array is omitted when empty. It reports CSS variables with no `.dark` override.
+
+To extract failures: filter items where `"passes": false`. Use the `"theme"` field to distinguish light vs. dark findings.
 
 ### Step 5: Interpret results
 
@@ -147,7 +153,7 @@ OPTIONS:
 - Semantic tokens from tailwind.config.ts/js
 - Default Tailwind v3 palette (all 22 color families)
 - Opacity modifiers (e.g. primary/50)
-- Variant prefix stripping (dark:, hover:, sm:, etc.)
+- Theme-aware variant handling: `dark:` classes are excluded in light mode, `light:` in dark mode. In dark mode, `dark:bg-X` overrides unprefixed `bg-Y` (matching Tailwind CSS specificity). Non-theme variants (hover:, sm:, etc.) are stripped normally.
 - Tailwind v4 detection with a warning when the built-in v3 fallback palette may be incomplete
 
 ### WCAG 2.1 thresholds

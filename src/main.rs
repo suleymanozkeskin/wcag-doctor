@@ -6,7 +6,8 @@ use rayon::prelude::*;
 
 use wcag_doctor::audit::design_system::audit_design_system;
 use wcag_doctor::config::{TailwindVersion, detect_project, is_excluded_path};
-use wcag_doctor::contrast::levels::MinimumLevel;
+use wcag_doctor::contrast::levels::{ConformanceLevel, MinimumLevel};
+use wcag_doctor::contrast::wcag::contrast_over_backdrops;
 use wcag_doctor::report::json::build_json_report;
 use wcag_doctor::report::terminal::{print_component_report, print_design_system_report};
 use wcag_doctor::resolver::css_vars::{
@@ -17,6 +18,7 @@ use wcag_doctor::resolver::tailwind::{TailwindColorConfig, parse_tailwind_config
 use wcag_doctor::scanner::component::{ColorPair, Theme, dedup_color_pairs, scan_component};
 use wcag_doctor::scanner::graph::build_component_graph;
 use wcag_doctor::scanner::propagation::propagate_and_check;
+use wcag_doctor::wcag_config;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -44,6 +46,10 @@ struct Cli {
     /// Path to Tailwind config file (auto-detected if omitted).
     #[arg(long = "tailwind-config", value_name = "PATH")]
     tailwind_config: Option<PathBuf>,
+
+    /// Path to a wcag-doctor.json5 audit config (auto-detected if omitted).
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 
     /// Which theme to check.
     #[arg(long, default_value = "both", value_parser = parse_theme)]
@@ -198,14 +204,65 @@ fn main() {
         }
     }
 
+    // Load optional audit config (backdrop samples + explicit surfaces).
+    let config_path = wcag_config::find_config(cli.config.as_deref(), &work_dir);
+    let wcag_cfg = match config_path {
+        Some(ref path) => match wcag_config::load_config(path) {
+            Ok(cfg) => {
+                if cli.verbose {
+                    eprintln!(
+                        "  Loaded audit config from {} ({} surface rule(s))",
+                        path.display(),
+                        cfg.surfaces.len()
+                    );
+                }
+                cfg
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                process::exit(1);
+            }
+        },
+        None => wcag_config::WcagConfig::default(),
+    };
+
+    // Resolve backdrop samples per theme; surface any unresolvable samples.
+    let (light_backdrops, light_backdrop_errors) =
+        wcag_config::resolve_samples(&wcag_cfg.backdrops.light, &resolved_vars.light);
+    let (dark_backdrops, dark_backdrop_errors) =
+        wcag_config::resolve_samples(&wcag_cfg.backdrops.dark, &resolved_vars.dark);
+    for err in light_backdrop_errors
+        .iter()
+        .chain(dark_backdrop_errors.iter())
+    {
+        warnings.push(format!("backdrop sample could not be resolved: {err}"));
+        if cli.verbose {
+            eprintln!("  Warning: backdrop sample: {err}");
+        }
+    }
+    if cli.verbose && (!light_backdrops.is_empty() || !dark_backdrops.is_empty()) {
+        eprintln!(
+            "  Backdrop samples: {} light, {} dark",
+            light_backdrops.len(),
+            dark_backdrops.len()
+        );
+    }
+
     // Run the requested modes
     let mut design_pairs = Vec::new();
     let mut component_pairs = Vec::new();
 
     // Design system audit
     if cli.system {
-        design_pairs =
-            audit_design_system(&resolved_vars.light, &resolved_vars.dark, check_light, check_dark);
+        design_pairs = audit_design_system(
+            &resolved_vars.light,
+            &resolved_vars.dark,
+            check_light,
+            check_dark,
+            &light_backdrops,
+            &dark_backdrops,
+            &wcag_cfg.surfaces,
+        );
     }
 
     // Component scanning
@@ -264,6 +321,28 @@ fn main() {
         }
 
         component_pairs = dedup_color_pairs(component_pairs);
+    }
+
+    // A component pair with a translucent background is scanned with a black/white
+    // worst-case (the scanner has no backdrop context). Recompute those over the
+    // theme's configured backdrop so component findings match the --system audit.
+    if !light_backdrops.is_empty() || !dark_backdrops.is_empty() {
+        for pair in &mut component_pairs {
+            if pair.background_color.a >= 1.0 {
+                continue;
+            }
+            let backdrops = if pair.theme == "dark" {
+                &dark_backdrops
+            } else {
+                &light_backdrops
+            };
+            if backdrops.is_empty() {
+                continue;
+            }
+            pair.ratio =
+                contrast_over_backdrops(&pair.foreground_color, &pair.background_color, backdrops);
+            pair.level = ConformanceLevel::from_ratio(pair.ratio);
+        }
     }
 
     // Output results

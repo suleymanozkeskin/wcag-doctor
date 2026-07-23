@@ -26,6 +26,8 @@ pub struct ColorPair {
     pub line: usize,
     pub element: String,
     pub theme: String,
+    /// Interaction state this pair applies in ("base", "hover", "focus", …).
+    pub state: String,
 }
 
 /// Colors found on a single JSX element.
@@ -33,8 +35,46 @@ pub struct ColorPair {
 struct ElementColors {
     foregrounds: Vec<(String, Rgba)>,
     backgrounds: Vec<(String, Rgba)>,
+    /// Per-interaction-state overrides layered on top of the base colors.
+    state_layers: Vec<StateLayer>,
     line: usize,
     element_name: String,
+}
+
+/// The foreground/background utilities a single interaction state contributes,
+/// after resolving the theme-specific override within that state.
+#[derive(Debug)]
+struct StateLayer {
+    state: InteractionState,
+    foregrounds: Vec<(String, Rgba)>,
+    backgrounds: Vec<(String, Rgba)>,
+}
+
+/// Base + theme-override buckets collected for one interaction state.
+#[derive(Default)]
+struct StateBuckets {
+    base_fgs: Vec<(String, Rgba)>,
+    base_bgs: Vec<(String, Rgba)>,
+    override_fgs: Vec<(String, Rgba)>,
+    override_bgs: Vec<(String, Rgba)>,
+}
+
+impl StateBuckets {
+    /// Resolve to effective (foreground, background) lists: theme-specific classes
+    /// win over base classes (higher CSS specificity), matching `.dark &`.
+    fn into_effective(self) -> (Vec<(String, Rgba)>, Vec<(String, Rgba)>) {
+        let fgs = if self.override_fgs.is_empty() {
+            self.base_fgs
+        } else {
+            self.override_fgs
+        };
+        let bgs = if self.override_bgs.is_empty() {
+            self.base_bgs
+        } else {
+            self.override_bgs
+        };
+        (fgs, bgs)
+    }
 }
 
 /// Scan a single component file for color pairs.
@@ -103,23 +143,75 @@ pub enum ThemeContext {
     LightOnly,
 }
 
+/// Interaction state derived from Tailwind variant prefixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InteractionState {
+    /// No interaction prefix — the resting state.
+    Base,
+    /// `hover:` / `group-hover:`
+    Hover,
+    /// `focus:` / `focus-within:`
+    Focus,
+    /// `focus-visible:`
+    FocusVisible,
+}
+
+impl InteractionState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            InteractionState::Base => "base",
+            InteractionState::Hover => "hover",
+            InteractionState::Focus => "focus",
+            InteractionState::FocusVisible => "focus-visible",
+        }
+    }
+}
+
 /// Parse variant prefixes and determine theme context.
 /// Returns (theme_context, base_class_without_prefixes).
 pub fn parse_variant_context(class: &str) -> (ThemeContext, &str) {
+    let (theme, _state, base) = parse_variant(class);
+    (theme, base)
+}
+
+/// The interaction state a single utility class applies in.
+pub fn interaction_state_of(class: &str) -> InteractionState {
+    parse_variant(class).1
+}
+
+/// Parse variant prefixes into theme context, interaction state, and the base
+/// utility class. E.g. `dark:hover:bg-accent` → (DarkOnly, Hover, "bg-accent").
+pub fn parse_variant(class: &str) -> (ThemeContext, InteractionState, &str) {
     let base = strip_variant_prefixes(class);
     if base.len() == class.len() {
-        return (ThemeContext::Base, base);
+        return (ThemeContext::Base, InteractionState::Base, base);
     }
     // The prefix portion is everything before the base class.
     // E.g., for "sm:dark:hover:bg-red-500" → prefix = "sm:dark:hover:"
     let prefix = &class[..class.len() - base.len()];
-    if prefix.split(':').any(|p| p == "dark") {
-        (ThemeContext::DarkOnly, base)
+
+    let theme = if prefix.split(':').any(|p| p == "dark") {
+        ThemeContext::DarkOnly
     } else if prefix.split(':').any(|p| p == "light") {
-        (ThemeContext::LightOnly, base)
+        ThemeContext::LightOnly
     } else {
-        (ThemeContext::Base, base)
+        ThemeContext::Base
+    };
+
+    (theme, interaction_state_from_prefix(prefix), base)
+}
+
+/// Map the first recognized interaction segment in a variant prefix to a state.
+fn interaction_state_from_prefix(prefix: &str) -> InteractionState {
+    for segment in prefix.split(':') {
+        match segment {
+            "focus-visible" => return InteractionState::FocusVisible,
+            "focus" | "focus-within" => return InteractionState::Focus,
+            "hover" | "group-hover" => return InteractionState::Hover,
+            _ => {}
+        }
     }
+    InteractionState::Base
 }
 
 /// Deduplicate component findings while preserving their original order.
@@ -136,6 +228,7 @@ pub fn dedup_color_pairs(pairs: Vec<ColorPair>) -> Vec<ColorPair> {
             pair.foreground_name.clone(),
             pair.background_name.clone(),
             pair.theme.clone(),
+            pair.state.clone(),
         );
         if seen.insert(key) {
             deduped.push(pair);
@@ -708,6 +801,12 @@ fn walk_expr(
             }
         },
         Expr::Call(call) => {
+            // `cva(...)` / `tv(...)` variant maps hold class strings in object/array
+            // literals that the generic arg walk does not reach. Scan each string
+            // independently — a variant's classes co-occur, different variants do not.
+            if is_variant_factory_call(call) {
+                scan_variant_factory_call(call, source, tw_config, vars, file, pairs, theme);
+            }
             if let Callee::Expr(callee) = &call.callee {
                 walk_expr(callee, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
@@ -820,25 +919,7 @@ fn process_jsx_element(
     };
 
     let theme_label = theme.label().to_string();
-
-    for (fg_name, fg_color) in &elem_colors.foregrounds {
-        for (bg_name, bg_color) in bg_source {
-            let ratio = contrast_ratio(fg_color, bg_color);
-            let level = ConformanceLevel::from_ratio(ratio);
-            pairs.push(ColorPair {
-                foreground_name: fg_name.clone(),
-                foreground_color: *fg_color,
-                background_name: bg_name.clone(),
-                background_color: *bg_color,
-                ratio,
-                level,
-                file: file.to_string(),
-                line: elem_colors.line,
-                element: elem_colors.element_name.clone(),
-                theme: theme_label.clone(),
-            });
-        }
-    }
+    emit_element_pairs(&elem_colors, bg_source, file, &theme_label, pairs);
 
     // Recurse into children with the effective background context
     for child in &element.children {
@@ -846,14 +927,155 @@ fn process_jsx_element(
     }
 }
 
-/// Extract colors from Tailwind classes with theme-aware filtering and override.
+/// Emit base + interaction-state contrast pairs for one element's collected colors.
 ///
-/// **Filtering**: `dark:` prefixed classes are excluded in light mode and vice versa.
+/// The resting state pairs each foreground against `bg_source`. Each interaction
+/// state overrides the base per the CSS cascade: a state's own foreground/background
+/// wins, and any property it does not change carries over from the base.
+fn emit_element_pairs(
+    elem: &ElementColors,
+    bg_source: &[(String, Rgba)],
+    file: &str,
+    theme_label: &str,
+    pairs: &mut Vec<ColorPair>,
+) {
+    let mut push = |fg: &(String, Rgba), bg: &(String, Rgba), state: &str| {
+        let ratio = contrast_ratio(&fg.1, &bg.1);
+        pairs.push(ColorPair {
+            foreground_name: fg.0.clone(),
+            foreground_color: fg.1,
+            background_name: bg.0.clone(),
+            background_color: bg.1,
+            ratio,
+            level: ConformanceLevel::from_ratio(ratio),
+            file: file.to_string(),
+            line: elem.line,
+            element: elem.element_name.clone(),
+            theme: theme_label.to_string(),
+            state: state.to_string(),
+        });
+    };
+
+    for fg in &elem.foregrounds {
+        for bg in bg_source {
+            push(fg, bg, InteractionState::Base.label());
+        }
+    }
+
+    for layer in &elem.state_layers {
+        let state_fgs: &[(String, Rgba)] = if layer.foregrounds.is_empty() {
+            &elem.foregrounds
+        } else {
+            &layer.foregrounds
+        };
+        let state_bgs: &[(String, Rgba)] = if layer.backgrounds.is_empty() {
+            bg_source
+        } else {
+            &layer.backgrounds
+        };
+        for fg in state_fgs {
+            for bg in state_bgs {
+                push(fg, bg, layer.state.label());
+            }
+        }
+    }
+}
+
+/// Whether a call is a class-variant factory (`cva(...)` or `tv(...)`) whose
+/// arguments hold Tailwind class strings in object/array literals.
+fn is_variant_factory_call(call: &CallExpr) -> bool {
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    matches!(&**callee, Expr::Ident(ident) if matches!(ident.sym.as_str(), "cva" | "tv"))
+}
+
+/// Scan a `cva()`/`tv()` call: each class string literal is scanned independently
+/// (a variant's classes co-occur; separate variants are mutually exclusive), so
+/// within-string foreground/background pairs — including `hover:`/`focus:` states —
+/// are detected even though the classes never appear on a JSX element directly.
+fn scan_variant_factory_call(
+    call: &CallExpr,
+    source: &str,
+    tw_config: &TailwindColorConfig,
+    vars: &HashMap<String, Rgba>,
+    file: &str,
+    pairs: &mut Vec<ColorPair>,
+    theme: Theme,
+) {
+    let theme_label = theme.label().to_string();
+    let mut strings: Vec<(String, usize)> = Vec::new();
+    for arg in &call.args {
+        collect_class_string_literals(&arg.expr, source, &mut strings);
+    }
+
+    for (class_str, line) in strings {
+        let mut elem = ElementColors {
+            line,
+            element_name: "cva".to_string(),
+            ..Default::default()
+        };
+        extract_colors_from_classes(&class_str, tw_config, vars, &mut elem, theme);
+        // A cva string is self-contained: its own backgrounds are the only context.
+        let bg_source = elem.backgrounds.clone();
+        emit_element_pairs(&elem, &bg_source, file, &theme_label, pairs);
+    }
+}
+
+/// Collect string-literal class sources (with their line numbers) from a `cva`/`tv`
+/// argument, descending through array and object-value literals.
+fn collect_class_string_literals(expr: &Expr, source: &str, out: &mut Vec<(String, usize)>) {
+    match expr {
+        Expr::Lit(Lit::Str(s)) => {
+            let line = byte_offset_to_line(source, s.span.lo.0 as usize);
+            out.push((wtf8_to_string(s), line));
+        }
+        Expr::Tpl(tpl) => {
+            let text = extract_strings_from_expr(expr);
+            if !text.trim().is_empty() {
+                let line = byte_offset_to_line(source, tpl.span.lo.0 as usize);
+                out.push((text, line));
+            }
+        }
+        Expr::Array(arr) => {
+            for elem in arr.elems.iter().flatten() {
+                collect_class_string_literals(&elem.expr, source, out);
+            }
+        }
+        Expr::Object(obj) => {
+            for prop in &obj.props {
+                if let PropOrSpread::Prop(prop) = prop {
+                    if let Prop::KeyValue(kv) = &**prop {
+                        collect_class_string_literals(&kv.value, source, out);
+                    }
+                }
+            }
+        }
+        Expr::Paren(p) => collect_class_string_literals(&p.expr, source, out),
+        Expr::Cond(cond) => {
+            collect_class_string_literals(&cond.cons, source, out);
+            collect_class_string_literals(&cond.alt, source, out);
+        }
+        Expr::Bin(bin) => {
+            collect_class_string_literals(&bin.left, source, out);
+            collect_class_string_literals(&bin.right, source, out);
+        }
+        _ => {}
+    }
+}
+
+/// Extract colors from Tailwind classes with theme- and state-aware handling.
 ///
-/// **Override**: In dark mode, if any `dark:bg-*` class exists, it replaces all
-/// unprefixed `bg-*` classes (matching Tailwind's CSS specificity model where
-/// `.dark &` has higher specificity than the base selector). Same for foreground
-/// classes. In light mode, `light:` prefixed classes override base classes.
+/// **Theme filtering**: `dark:` classes are excluded in light mode and vice versa.
+///
+/// **Theme override**: within one interaction state, a theme-specific class
+/// (`dark:bg-*` in dark mode) replaces the unprefixed base class, matching
+/// Tailwind's specificity model where `.dark &` outranks the base selector.
+///
+/// **Interaction state**: `hover:`/`focus:`/`focus-visible:` classes are bucketed
+/// per state. The resting state feeds the element's own colors (and inheritance);
+/// each interaction state becomes a [`StateLayer`] that overrides the base on
+/// `:hover`/`:focus`, mirroring how those pseudo-classes cascade at render time.
 fn extract_colors_from_classes(
     class_str: &str,
     tw_config: &TailwindColorConfig,
@@ -861,13 +1083,10 @@ fn extract_colors_from_classes(
     elem: &mut ElementColors,
     theme: Theme,
 ) {
-    let mut base_fgs: Vec<(String, Rgba)> = Vec::new();
-    let mut base_bgs: Vec<(String, Rgba)> = Vec::new();
-    let mut override_fgs: Vec<(String, Rgba)> = Vec::new();
-    let mut override_bgs: Vec<(String, Rgba)> = Vec::new();
+    let mut by_state: HashMap<InteractionState, StateBuckets> = HashMap::new();
 
     for class in class_str.split_whitespace() {
-        let (context, base_class) = parse_variant_context(class);
+        let (context, state, base_class) = parse_variant(class);
 
         // Skip classes that don't apply to this theme
         match (theme, context) {
@@ -876,34 +1095,60 @@ fn extract_colors_from_classes(
             _ => {}
         }
 
-        if let Some((kind, color_name)) = parse_utility_class(base_class) {
-            if let Some(rgba) = resolve_tailwind_color(&color_name, tw_config, vars) {
-                let display_name = base_class.to_string();
-                let is_override = match theme {
-                    Theme::Light => context == ThemeContext::LightOnly,
-                    Theme::Dark => context == ThemeContext::DarkOnly,
-                };
+        let Some((kind, color_name)) = parse_utility_class(base_class) else {
+            continue;
+        };
+        let Some(rgba) = resolve_tailwind_color(&color_name, tw_config, vars) else {
+            continue;
+        };
 
-                if kind.is_foreground() {
-                    if is_override {
-                        override_fgs.push((display_name, rgba));
-                    } else {
-                        base_fgs.push((display_name, rgba));
-                    }
-                } else if kind.is_background() {
-                    if is_override {
-                        override_bgs.push((display_name, rgba));
-                    } else {
-                        base_bgs.push((display_name, rgba));
-                    }
-                }
+        let display_name = base_class.to_string();
+        let is_override = match theme {
+            Theme::Light => context == ThemeContext::LightOnly,
+            Theme::Dark => context == ThemeContext::DarkOnly,
+        };
+        let buckets = by_state.entry(state).or_default();
+
+        if kind.is_foreground() {
+            if is_override {
+                buckets.override_fgs.push((display_name, rgba));
+            } else {
+                buckets.base_fgs.push((display_name, rgba));
+            }
+        } else if kind.is_background() {
+            if is_override {
+                buckets.override_bgs.push((display_name, rgba));
+            } else {
+                buckets.base_bgs.push((display_name, rgba));
             }
         }
     }
 
-    // Theme-specific classes override base classes (higher CSS specificity).
-    elem.foregrounds.extend(if !override_fgs.is_empty() { override_fgs } else { base_fgs });
-    elem.backgrounds.extend(if !override_bgs.is_empty() { override_bgs } else { base_bgs });
+    // The resting state feeds the element's own colors and child inheritance.
+    if let Some(base) = by_state.remove(&InteractionState::Base) {
+        let (fgs, bgs) = base.into_effective();
+        elem.foregrounds.extend(fgs);
+        elem.backgrounds.extend(bgs);
+    }
+
+    // Interaction states become layers, in a fixed order for deterministic output.
+    for state in [
+        InteractionState::Hover,
+        InteractionState::Focus,
+        InteractionState::FocusVisible,
+    ] {
+        if let Some(buckets) = by_state.remove(&state) {
+            let (fgs, bgs) = buckets.into_effective();
+            if fgs.is_empty() && bgs.is_empty() {
+                continue;
+            }
+            elem.state_layers.push(StateLayer {
+                state,
+                foregrounds: fgs,
+                backgrounds: bgs,
+            });
+        }
+    }
 }
 
 fn extract_colors_from_inline_style(
@@ -1423,6 +1668,7 @@ mod tests {
                 line: 10,
                 element: "Sidebar".to_string(),
                 theme: "light".to_string(),
+                state: "base".to_string(),
             },
             ColorPair {
                 foreground_name: "text-red-500".to_string(),
@@ -1435,6 +1681,7 @@ mod tests {
                 line: 10,
                 element: "Sidebar".to_string(),
                 theme: "light".to_string(),
+                state: "base".to_string(),
             },
             ColorPair {
                 foreground_name: "text-red-500".to_string(),
@@ -1447,6 +1694,7 @@ mod tests {
                 line: 10,
                 element: "Sidebar".to_string(),
                 theme: "light".to_string(),
+                state: "base".to_string(),
             },
             ColorPair {
                 foreground_name: "text-red-500".to_string(),
@@ -1459,6 +1707,7 @@ mod tests {
                 line: 10,
                 element: "Button".to_string(),
                 theme: "light".to_string(),
+                state: "base".to_string(),
             },
         ];
 
@@ -1467,5 +1716,128 @@ mod tests {
         assert_eq!(deduped[0].background_name, "bg-white");
         assert_eq!(deduped[1].background_name, "bg-blue-500");
         assert_eq!(deduped[2].element, "Button");
+    }
+
+    #[test]
+    fn test_parse_variant_extracts_state() {
+        assert_eq!(
+            parse_variant("hover:bg-accent"),
+            (ThemeContext::Base, InteractionState::Hover, "bg-accent")
+        );
+        assert_eq!(
+            parse_variant("dark:hover:bg-accent"),
+            (ThemeContext::DarkOnly, InteractionState::Hover, "bg-accent")
+        );
+        assert_eq!(
+            parse_variant("focus-visible:ring-2"),
+            (ThemeContext::Base, InteractionState::FocusVisible, "ring-2")
+        );
+        assert_eq!(
+            parse_variant("focus:text-white"),
+            (ThemeContext::Base, InteractionState::Focus, "text-white")
+        );
+        assert_eq!(
+            parse_variant("bg-primary"),
+            (ThemeContext::Base, InteractionState::Base, "bg-primary")
+        );
+    }
+
+    #[test]
+    fn test_hover_state_produces_tagged_pair() {
+        // A ghost-button-style element: no resting bg/fg, both set only on hover.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("component.tsx");
+        let source = r#"
+            export function Ghost() {
+                return <button className="hover:bg-blue-500 hover:text-white" />;
+            }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Light,
+        );
+
+        // No resting-state pair (no base bg/fg), exactly one hover pair.
+        assert!(pairs.iter().all(|p| p.state == "hover"));
+        let hover = pairs
+            .iter()
+            .find(|p| p.foreground_name == "text-white" && p.background_name == "bg-blue-500")
+            .expect("hover pair present");
+        assert_eq!(hover.state, "hover");
+    }
+
+    #[test]
+    fn test_hover_bg_pairs_against_base_foreground() {
+        // Only the background changes on hover; the resting text color carries over.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("component.tsx");
+        let source = r#"
+            export function Item() {
+                return <div className="text-white hover:bg-blue-500" />;
+            }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Light,
+        );
+
+        // Base has a foreground but no background → no base pair; hover pairs the
+        // carried-over base foreground against the hover background.
+        let hover = pairs
+            .iter()
+            .find(|p| p.state == "hover")
+            .expect("hover pair present");
+        assert_eq!(hover.foreground_name, "text-white");
+        assert_eq!(hover.background_name, "bg-blue-500");
+    }
+
+    #[test]
+    fn test_cva_variant_strings_are_scanned() {
+        // Class strings live only in a cva() variant map (no JSX element), yet the
+        // base and hover pairs inside each variant string must still be found.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("button.tsx");
+        let source = r#"
+            const button = cva("inline-flex text-sm", {
+                variants: {
+                    variant: {
+                        solid: "bg-blue-500 text-white",
+                        ghost: "hover:bg-blue-500 hover:text-white",
+                    },
+                },
+            });
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Light,
+        );
+
+        // The solid variant is a resting-state pair.
+        assert!(
+            pairs.iter().any(|p| p.state == "base"
+                && p.foreground_name == "text-white"
+                && p.background_name == "bg-blue-500"),
+            "solid variant base pair missing"
+        );
+        // The ghost variant only sets colors on hover.
+        assert!(
+            pairs.iter().any(|p| p.state == "hover"
+                && p.foreground_name == "text-white"
+                && p.background_name == "bg-blue-500"),
+            "ghost variant hover pair missing"
+        );
+        assert!(pairs.iter().all(|p| p.element == "cva"));
     }
 }

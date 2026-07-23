@@ -5,7 +5,9 @@ use rayon::prelude::*;
 use serde_json::Value;
 use swc_ecma_ast::*;
 
-use crate::scanner::component::{byte_offset_to_line, extract_strings_from_expr};
+use crate::scanner::component::{
+    InteractionState, byte_offset_to_line, extract_strings_from_expr, interaction_state_of,
+};
 
 /// A node in the component import/usage graph.
 #[derive(Debug)]
@@ -569,7 +571,12 @@ fn process_jsx_for_usages(
                             Some(idx) => &class[idx + 1..],
                             None => class,
                         };
-                        if base.starts_with("bg-") {
+                        // Only resting-state backgrounds are always-on ancestors.
+                        // A `hover:bg-*`/`focus:bg-*` parent is not a background the
+                        // child inherits at rest, so it must not propagate.
+                        if base.starts_with("bg-")
+                            && interaction_state_of(class) == InteractionState::Base
+                        {
                             // Store full class with variant prefixes (e.g. "dark:bg-slate-900")
                             // so propagation can apply theme-aware filtering.
                             current_bg_classes.push(class.to_string());

@@ -122,7 +122,7 @@ pub fn extract_css_vars_with_diagnostics(css_content: &str) -> (CssVarMap, Vec<S
 
     if let Ok(sheet) = StyleSheet::parse_with(css_content, options, &mut ThemeAtRuleParser) {
         let mut map = CssVarMap::default();
-        walk_rules(&sheet.rules, &mut map, false);
+        walk_rules(&sheet.rules, &mut map, false, false);
         return (map, collect_css_diagnostics(&warnings));
     }
 
@@ -238,28 +238,49 @@ fn walk_rules<'i>(
     rules: &CssRuleList<'i, ThemeAtRule<'i>>,
     map: &mut CssVarMap,
     in_dark_media: bool,
+    in_conditional: bool,
 ) {
     for rule in &rules.0 {
         match rule {
             CssRule::Style(style) => {
-                apply_style_rule(&style.selectors, &style.declarations, map, in_dark_media);
-                walk_rules(&style.rules, map, in_dark_media);
+                apply_style_rule(
+                    &style.selectors,
+                    &style.declarations,
+                    map,
+                    in_dark_media,
+                    in_conditional,
+                );
+                walk_rules(&style.rules, map, in_dark_media, in_conditional);
             }
             CssRule::Media(media) => {
+                // A `prefers-color-scheme` media query is a theme source, not a
+                // situational override. Any other media query (reduced-transparency,
+                // width, print, …) is conditional: its declarations must not clobber
+                // the default value a variable has in `:root`/`.dark`.
+                let color_scheme = media_list_is_color_scheme(&media.query);
                 walk_rules(
                     &media.rules,
                     map,
                     in_dark_media || media_list_prefers_dark(&media.query),
+                    in_conditional || !color_scheme,
                 );
             }
-            CssRule::Supports(rule) => walk_rules(&rule.rules, map, in_dark_media),
-            CssRule::LayerBlock(rule) => walk_rules(&rule.rules, map, in_dark_media),
-            CssRule::Container(rule) => walk_rules(&rule.rules, map, in_dark_media),
-            CssRule::Scope(rule) => walk_rules(&rule.rules, map, in_dark_media),
-            CssRule::StartingStyle(rule) => walk_rules(&rule.rules, map, in_dark_media),
+            // `@supports` fallbacks (e.g. `@supports not (backdrop-filter)`) restyle
+            // for a capability the default render does not use — never override base.
+            CssRule::Supports(rule) => walk_rules(&rule.rules, map, in_dark_media, true),
+            CssRule::LayerBlock(rule) => walk_rules(&rule.rules, map, in_dark_media, in_conditional),
+            CssRule::Container(rule) => walk_rules(&rule.rules, map, in_dark_media, true),
+            CssRule::Scope(rule) => walk_rules(&rule.rules, map, in_dark_media, in_conditional),
+            CssRule::StartingStyle(rule) => walk_rules(&rule.rules, map, in_dark_media, true),
             CssRule::Nesting(rule) => {
-                apply_style_rule(&rule.style.selectors, &rule.style.declarations, map, in_dark_media);
-                walk_rules(&rule.style.rules, map, in_dark_media);
+                apply_style_rule(
+                    &rule.style.selectors,
+                    &rule.style.declarations,
+                    map,
+                    in_dark_media,
+                    in_conditional,
+                );
+                walk_rules(&rule.style.rules, map, in_dark_media, in_conditional);
             }
             CssRule::NestedDeclarations(rule) => {
                 let target = if in_dark_media {
@@ -267,10 +288,10 @@ fn walk_rules<'i>(
                 } else {
                     &mut map.light
                 };
-                insert_declarations(&rule.declarations, target);
+                insert_declarations(&rule.declarations, target, !in_conditional);
             }
             CssRule::Custom(rule) => {
-                insert_declarations(&rule.declarations, &mut map.light);
+                insert_declarations(&rule.declarations, &mut map.light, !in_conditional);
             }
             _ => {}
         }
@@ -282,17 +303,32 @@ fn apply_style_rule(
     declarations: &DeclarationBlock<'_>,
     map: &mut CssVarMap,
     in_dark_media: bool,
+    in_conditional: bool,
 ) {
     let targets = classify_selectors(selectors, in_dark_media);
+    let allow_override = !in_conditional;
     if targets.light {
-        insert_declarations(declarations, &mut map.light);
+        insert_declarations(declarations, &mut map.light, allow_override);
     }
     if targets.dark {
-        insert_declarations(declarations, &mut map.dark);
+        insert_declarations(declarations, &mut map.dark, allow_override);
     }
 }
 
-fn insert_declarations(declarations: &DeclarationBlock<'_>, target: &mut HashMap<String, String>) {
+/// Insert custom-property declarations into `target`.
+///
+/// `allow_override` mirrors the CSS cascade at the level that matters for a
+/// static audit of the *default* render: base declarations (`:root`, `.dark`,
+/// `prefers-color-scheme` media, `@theme`) overwrite earlier values, while
+/// declarations nested in a conditional at-rule (`@supports`, other `@media`)
+/// only fill gaps — they never replace a value the variable already has by
+/// default. This keeps translucent tokens translucent even when an accessibility
+/// fallback redefines them as opaque.
+fn insert_declarations(
+    declarations: &DeclarationBlock<'_>,
+    target: &mut HashMap<String, String>,
+    allow_override: bool,
+) {
     for property in declarations
         .declarations
         .iter()
@@ -300,10 +336,13 @@ fn insert_declarations(declarations: &DeclarationBlock<'_>, target: &mut HashMap
     {
         if let Property::Custom(custom) = property {
             if let Ok(value) = property.value_to_css_string(PrinterOptions::default()) {
-                target.insert(
-                    custom.name.as_ref().to_string(),
-                    normalize_css_var_value(value.trim()),
-                );
+                let name = custom.name.as_ref().to_string();
+                let normalized = normalize_css_var_value(value.trim());
+                if allow_override {
+                    target.insert(name, normalized);
+                } else {
+                    target.entry(name).or_insert(normalized);
+                }
             }
         }
     }
@@ -468,6 +507,37 @@ fn expand_shorthand_hex(value: &str) -> Option<String> {
         expanded.push(ch);
     }
     Some(expanded)
+}
+
+/// Whether a media query is a `prefers-color-scheme` query (dark or light).
+/// Such queries define a theme's base values; every other media query is a
+/// situational override for audit purposes.
+fn media_list_is_color_scheme(media_list: &MediaList<'_>) -> bool {
+    media_list
+        .media_queries
+        .iter()
+        .any(|query| query.condition.as_ref().is_some_and(media_condition_is_color_scheme))
+}
+
+fn media_condition_is_color_scheme(condition: &MediaCondition<'_>) -> bool {
+    match condition {
+        MediaCondition::Feature(feature) => media_feature_is_color_scheme(feature),
+        MediaCondition::Operation { conditions, .. } => {
+            conditions.iter().any(media_condition_is_color_scheme)
+        }
+        MediaCondition::Not(condition) => media_condition_is_color_scheme(condition),
+        MediaCondition::Unknown(_) => false,
+    }
+}
+
+fn media_feature_is_color_scheme(feature: &QueryFeature<'_, MediaFeatureId>) -> bool {
+    let name = match feature {
+        QueryFeature::Plain { name, .. }
+        | QueryFeature::Range { name, .. }
+        | QueryFeature::Boolean { name }
+        | QueryFeature::Interval { name, .. } => name,
+    };
+    matches!(name, MediaFeatureName::Standard(MediaFeatureId::PrefersColorScheme))
 }
 
 fn media_list_prefers_dark(media_list: &MediaList<'_>) -> bool {
@@ -745,5 +815,85 @@ mod tests {
         let map = extract_css_vars(css);
         let missing = find_missing_dark_overrides(&map);
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_supports_fallback_does_not_clobber_translucent_base() {
+        // Mirrors the liquid-glass pattern: a translucent token in `:root`, then an
+        // opaque redefinition inside a `@supports not (backdrop-filter)` fallback.
+        // The default render is translucent, so the base value must win.
+        let css = r#"
+            :root {
+                --sidebar: oklch(0.9848 0 0 / 0.55);
+            }
+            @supports not (backdrop-filter: blur(1px)) {
+                :root {
+                    --sidebar: oklch(0.9848 0 0);
+                }
+            }
+        "#;
+        let resolved = resolve_var_colors(&extract_css_vars(css));
+        let sidebar = resolved.light.get("--sidebar").unwrap();
+        assert!(
+            (sidebar.a - 0.55).abs() < 0.01,
+            "base translucent value must survive the @supports opaque fallback, got alpha {}",
+            sidebar.a
+        );
+    }
+
+    #[test]
+    fn test_reduced_transparency_media_does_not_clobber_base() {
+        // A non-color-scheme media query (reduced-transparency) is a situational
+        // override and must not replace the default translucent value.
+        let css = r#"
+            :root {
+                --panel: oklch(1 0 0 / 0.5);
+            }
+            @media (prefers-reduced-transparency: reduce) {
+                :root {
+                    --panel: oklch(1 0 0);
+                }
+            }
+        "#;
+        let resolved = resolve_var_colors(&extract_css_vars(css));
+        let panel = resolved.light.get("--panel").unwrap();
+        assert!(
+            (panel.a - 0.5).abs() < 0.01,
+            "reduced-transparency fallback must not replace the default translucent value, got alpha {}",
+            panel.a
+        );
+    }
+
+    #[test]
+    fn test_prefers_color_scheme_media_still_overrides_as_theme() {
+        // A prefers-color-scheme media query is a theme source, not a conditional
+        // override: later dark base values still win within the dark theme.
+        let css = r#"
+            :root {
+                --background: #ffffff;
+            }
+            @media (prefers-color-scheme: dark) {
+                :root {
+                    --background: #000000;
+                }
+            }
+        "#;
+        let map = extract_css_vars(css);
+        assert_eq!(map.dark.get("--background").unwrap(), "#000000");
+    }
+
+    #[test]
+    fn test_conditional_fallback_fills_gap_when_no_base() {
+        // If a variable is ONLY defined inside a conditional at-rule, the fallback
+        // value should still be captured (fill-the-gap, not dropped).
+        let css = r#"
+            @supports not (backdrop-filter: blur(1px)) {
+                :root {
+                    --only-here: #123456;
+                }
+            }
+        "#;
+        let map = extract_css_vars(css);
+        assert_eq!(map.light.get("--only-here").unwrap(), "#123456");
     }
 }

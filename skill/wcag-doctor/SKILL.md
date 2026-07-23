@@ -1,6 +1,6 @@
 ---
 name: wcag-doctor
-description: WCAG 2.1 color contrast compliance checker for frontend projects. Audits design system CSS custom properties and scans React/Next.js components for contrast violations against AA and AAA thresholds. Use this skill whenever the user mentions contrast, accessibility, WCAG, a11y, color compliance, or asks to audit colors — even if they don't explicitly say "contrast check". Also use when reviewing globals.css, Tailwind color tokens, shadcn themes, or any CSS custom property color system, since these are prime candidates for contrast issues.
+description: WCAG 2.1 color contrast compliance checker for frontend projects. Audits design system CSS custom properties and scans React/Next.js components for contrast violations against AA and AAA thresholds, including translucent "glass" surfaces composited over a configured backdrop and hover/focus interaction states. Use this skill whenever the user mentions contrast, accessibility, WCAG, a11y, color compliance, low-contrast placements, or asks to audit colors — even if they don't explicitly say "contrast check". Also use when reviewing globals.css, Tailwind color tokens, shadcn themes, frosted-glass/translucent surfaces, or any CSS custom property color system, since these are prime candidates for contrast issues.
 ---
 
 # WCAG Doctor
@@ -44,6 +44,39 @@ wcag-doctor --system --css path/to/globals.css --json
 
 This is the highest-value check. It catches design system-level issues that affect every component using those tokens.
 
+### Step 2b: Translucent surfaces over a backdrop (glass / frosted UI)
+
+Translucent surfaces (e.g. `oklch(1 0 0 / 0.62)` frosted panels) do not sit on a
+token — they sit on whatever renders behind them (a wallpaper, gradient, or mesh),
+so their real contrast cannot be read from the token alone. If the project has a
+`wcag-doctor.json5` config it is auto-detected; otherwise pass `--config path`.
+
+```json5
+{
+  backdrops: {
+    light: ["var(--mesh-1)", "var(--mesh-2)", "#204050"],
+    dark:  ["var(--mesh-1)", "var(--mesh-2)"],
+  },
+  surfaces: [
+    { background: "--glass-surface", foregrounds: ["--foreground", "--muted-foreground"] },
+    { background: "--glass-field",   foregrounds: ["--foreground"] },
+  ],
+}
+```
+
+- `backdrops` lists the backdrop's sample colors per theme (literal colors or
+  `var(--token)` references). A pair passes only if it clears the **worst** sample
+  — a moving backdrop must read at every point.
+- `surfaces` names translucent backgrounds the `--x`/`--x-foreground` convention
+  does not pair, and the foreground tokens placed on them.
+- In `--json`, these pairs (and any translucent conventional pair such as
+  `--sidebar`) carry `"over_backdrop": true`. Without a config, a translucent
+  surface with an unknown backdrop is evaluated over black and white, worst-case.
+
+When no config exists but the CSS clearly uses frosted/glass surfaces
+(translucent `--glass-*`, `--surface-*`, or a `.liquid-backdrop`/wallpaper layer),
+offer to write a `wcag-doctor.json5` so those surfaces are audited accurately.
+
 ### Step 3: Run component scanning
 
 For component-level analysis, scan entire directories:
@@ -57,6 +90,9 @@ The component scanner:
 - Extracts Tailwind classes from className, cn(), clsx(), template literals
 - Extracts inline style colors (backgroundColor, color, fill)
 - Detects foreground/background pairs on the same element
+- Extracts `hover:` / `focus:` / `focus-visible:` states as separate pairs (reported via the `state` field): a state's utilities override the base, and unchanged properties carry over, matching how `:hover`/`:focus` cascade
+- Scans `cva()` / `tv()` (class-variance-authority / tailwind-variants) variant maps: each variant's class string is checked independently, so pairs defined only in a shared component's variants (e.g. a Button's `hover:` classes) are caught even without a JSX element
+- Composites translucent component backgrounds over the configured backdrop (same model as `--system`) when a config is present, instead of the black/white worst-case
 - Builds a cross-file component graph to detect inherited background colors
 - Resolves `tsconfig.json` / `jsconfig.json` path aliases such as `@/` and `~/`
 
@@ -82,7 +118,8 @@ The JSON output has this structure:
       "background": { "name": "--background", "hex": "#ffffff" },
       "ratio": 18.51,
       "level": "AAA",
-      "passes": true
+      "passes": true,
+      "over_backdrop": false
     }
   ],
   "components": [
@@ -91,6 +128,7 @@ The JSON output has this structure:
       "line": 42,
       "element": "p",
       "theme": "dark",
+      "state": "hover",
       "foreground": { "name": "text-gray-400", "hex": "#9ca3af" },
       "background": { "name": "bg-white", "hex": "#ffffff" },
       "ratio": 2.54,
@@ -106,7 +144,7 @@ The JSON output has this structure:
 
 The `warnings` array is omitted when empty. It reports CSS variables with no `.dark` override.
 
-To extract failures: filter items where `"passes": false`. Use the `"theme"` field to distinguish light vs. dark findings.
+To extract failures: filter items where `"passes": false`. Use `"theme"` to distinguish light vs. dark findings, `"state"` (`base` | `hover` | `focus` | `focus-visible`) to distinguish a resting-state failure from an interaction-only one, and `"over_backdrop": true` to mark design-system pairs whose translucent background was composited over the configured backdrop.
 
 ### Step 5: Interpret results
 
@@ -132,6 +170,7 @@ OPTIONS:
   --dir <PATH>                Scan all components in directory recursively
   --css <PATH>                Path to CSS file with custom properties
   --tailwind-config <PATH>    Path to Tailwind config file
+  --config <PATH>             Path to wcag-doctor.json5 (backdrops + surfaces; auto-detected)
   --theme light|dark|both     Which theme to check (default: both)
   --level aa-large|aa|aaa     Minimum passing level (default: aa)
   --json                      Output as JSON
@@ -153,7 +192,9 @@ OPTIONS:
 - Semantic tokens from tailwind.config.ts/js
 - Default Tailwind v3 palette (all 22 color families)
 - Opacity modifiers (e.g. primary/50)
-- Theme-aware variant handling: `dark:` classes are excluded in light mode, `light:` in dark mode. In dark mode, `dark:bg-X` overrides unprefixed `bg-Y` (matching Tailwind CSS specificity). Non-theme variants (hover:, sm:, etc.) are stripped normally.
+- Theme-aware variant handling: `dark:` classes are excluded in light mode, `light:` in dark mode. In dark mode, `dark:bg-X` overrides unprefixed `bg-Y` (matching Tailwind CSS specificity).
+- Interaction-state variants (`hover:`, `focus:`, `focus-visible:`) are bucketed per state and reported via the `state` field, rather than stripped. Other non-color variants (`sm:`, `group-*:`, etc.) are stripped normally.
+- Translucent backgrounds and a configured backdrop: see "Backdrop & surface config" — `--system` composites translucent surfaces over the backdrop; oklch/rgb/hsl alpha is preserved through resolution.
 - Tailwind v4 detection with a warning when the built-in v3 fallback palette may be incomplete
 
 ### WCAG 2.1 thresholds
@@ -166,3 +207,5 @@ OPTIONS:
 - Dynamic/computed runtime classes cannot always be resolved statically
 - Tailwind v4 projects are detected, but the built-in fallback palette is still v3-oriented
 - Static analysis can miss runtime-only theme or state combinations that are not present in source
+- `cva()`/`tv()` strings are scanned per-string: a pair split across the base string and a separate variant string (base sets the foreground, a variant sets the background) is not combined, since which variants apply together is a runtime decision
+- Non-text contrast (WCAG SC 1.4.11, 3:1 for UI components, borders, and adjacent surfaces) is not modeled separately — border/ring pairs are reported at the text threshold (see the border-failures note above). Flagging adjacent surface-vs-surface pairs would require detecting whether a visual boundary (border, shadow, spacing) exists, which static class analysis cannot do reliably

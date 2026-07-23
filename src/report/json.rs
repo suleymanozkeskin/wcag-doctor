@@ -32,6 +32,8 @@ pub struct JsonDesignSystemResult {
     pub ratio: f64,
     pub level: String,
     pub passes: bool,
+    /// The translucent background was composited over the configured backdrop.
+    pub over_backdrop: bool,
 }
 
 #[derive(Serialize)]
@@ -40,6 +42,8 @@ pub struct JsonComponentResult {
     pub line: usize,
     pub element: String,
     pub theme: String,
+    /// Interaction state ("base", "hover", "focus", "focus-visible").
+    pub state: String,
     pub foreground: JsonColorInfo,
     pub background: JsonColorInfo,
     pub ratio: f64,
@@ -89,6 +93,7 @@ pub fn build_json_report(
                 ratio: (p.ratio * 100.0).round() / 100.0,
                 level: p.level.label().to_string(),
                 passes,
+                over_backdrop: p.over_backdrop,
             }
         })
         .collect();
@@ -108,6 +113,7 @@ pub fn build_json_report(
                 line: p.line,
                 element: p.element.clone(),
                 theme: p.theme.clone(),
+                state: p.state.clone(),
                 foreground: JsonColorInfo {
                     name: p.foreground_name.clone(),
                     hex: p.foreground_color.to_hex(),
@@ -166,6 +172,7 @@ mod tests {
             line: 1,
             element: "p".to_string(),
             theme: "light".to_string(),
+            state: "base".to_string(),
         }];
 
         let report = build_json_report(&[], &components, MinimumLevel::AaLarge, &[]);

@@ -101,6 +101,7 @@ pub fn propagate_and_check(
                         line: usage.line,
                         element: usage.component_name.clone(),
                         theme: theme_label.clone(),
+                        state: "base".to_string(),
                     });
                 }
             }

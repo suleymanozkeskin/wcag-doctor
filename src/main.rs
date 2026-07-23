@@ -17,6 +17,7 @@ use wcag_doctor::resolver::tailwind::{TailwindColorConfig, parse_tailwind_config
 use wcag_doctor::scanner::component::{ColorPair, Theme, dedup_color_pairs, scan_component};
 use wcag_doctor::scanner::graph::build_component_graph;
 use wcag_doctor::scanner::propagation::propagate_and_check;
+use wcag_doctor::wcag_config;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -44,6 +45,10 @@ struct Cli {
     /// Path to Tailwind config file (auto-detected if omitted).
     #[arg(long = "tailwind-config", value_name = "PATH")]
     tailwind_config: Option<PathBuf>,
+
+    /// Path to a wcag-doctor.json5 audit config (auto-detected if omitted).
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 
     /// Which theme to check.
     #[arg(long, default_value = "both", value_parser = parse_theme)]
@@ -198,14 +203,65 @@ fn main() {
         }
     }
 
+    // Load optional audit config (backdrop samples + explicit surfaces).
+    let config_path = wcag_config::find_config(cli.config.as_deref(), &work_dir);
+    let wcag_cfg = match config_path {
+        Some(ref path) => match wcag_config::load_config(path) {
+            Ok(cfg) => {
+                if cli.verbose {
+                    eprintln!(
+                        "  Loaded audit config from {} ({} surface rule(s))",
+                        path.display(),
+                        cfg.surfaces.len()
+                    );
+                }
+                cfg
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                process::exit(1);
+            }
+        },
+        None => wcag_config::WcagConfig::default(),
+    };
+
+    // Resolve backdrop samples per theme; surface any unresolvable samples.
+    let (light_backdrops, light_backdrop_errors) =
+        wcag_config::resolve_samples(&wcag_cfg.backdrops.light, &resolved_vars.light);
+    let (dark_backdrops, dark_backdrop_errors) =
+        wcag_config::resolve_samples(&wcag_cfg.backdrops.dark, &resolved_vars.dark);
+    for err in light_backdrop_errors
+        .iter()
+        .chain(dark_backdrop_errors.iter())
+    {
+        warnings.push(format!("backdrop sample could not be resolved: {err}"));
+        if cli.verbose {
+            eprintln!("  Warning: backdrop sample: {err}");
+        }
+    }
+    if cli.verbose && (!light_backdrops.is_empty() || !dark_backdrops.is_empty()) {
+        eprintln!(
+            "  Backdrop samples: {} light, {} dark",
+            light_backdrops.len(),
+            dark_backdrops.len()
+        );
+    }
+
     // Run the requested modes
     let mut design_pairs = Vec::new();
     let mut component_pairs = Vec::new();
 
     // Design system audit
     if cli.system {
-        design_pairs =
-            audit_design_system(&resolved_vars.light, &resolved_vars.dark, check_light, check_dark);
+        design_pairs = audit_design_system(
+            &resolved_vars.light,
+            &resolved_vars.dark,
+            check_light,
+            check_dark,
+            &light_backdrops,
+            &dark_backdrops,
+            &wcag_cfg.surfaces,
+        );
     }
 
     // Component scanning

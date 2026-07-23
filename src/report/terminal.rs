@@ -50,10 +50,16 @@ pub fn print_design_system_report(pairs: &[DesignSystemPair], minimum: MinimumLe
             pair.foreground_name,
             pair.foreground_color.to_hex().dimmed()
         );
+        let backdrop_marker = if pair.over_backdrop {
+            " ⋯bd".dimmed().to_string()
+        } else {
+            String::new()
+        };
         let bg_display = format!(
-            "{} {}",
+            "{} {}{}",
             pair.background_name,
-            pair.background_color.to_hex().dimmed()
+            pair.background_color.to_hex().dimmed(),
+            backdrop_marker
         );
 
         let line = format_row(&[
@@ -114,7 +120,11 @@ pub fn print_component_report(pairs: &[ColorPair], minimum: MinimumLevel) {
         }
 
         let short_file = shorten_path(&pair.file);
-        let location = format!("{}:{} <{}>", short_file, pair.line, pair.element);
+        let location = if pair.state == "base" {
+            format!("{}:{} <{}>", short_file, pair.line, pair.element)
+        } else {
+            format!("{}:{} <{}:{}>", short_file, pair.line, pair.element, pair.state)
+        };
         let ratio_str = format!("{:.2}:1", pair.ratio);
         let level_str = format_level(pair.level);
 

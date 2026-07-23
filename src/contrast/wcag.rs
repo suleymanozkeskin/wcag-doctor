@@ -54,6 +54,34 @@ pub fn contrast_ratio(color1: &Rgba, color2: &Rgba) -> f64 {
         .min(contrast_ratio_over_backdrop(color1, color2, &white))
 }
 
+/// Contrast of `fg` over `bg`, where a translucent `bg` is itself composited
+/// over each backdrop sample. Returns the worst (minimum) ratio across all
+/// samples: a placement over a varying/animated backdrop must stay legible at
+/// every point, so the audit criterion is the worst point.
+///
+/// An empty `backdrops` slice falls back to [`contrast_ratio`] (the black/white
+/// worst-case used when the backdrop is unknown). Backdrop samples are treated
+/// as opaque; any alpha they carry is composited over white first so a
+/// translucent sample can never read darker than the surface it represents.
+pub fn contrast_over_backdrops(fg: &Rgba, bg: &Rgba, backdrops: &[Rgba]) -> f64 {
+    if backdrops.is_empty() {
+        return contrast_ratio(fg, bg);
+    }
+
+    let white = Rgba::opaque(255, 255, 255);
+    backdrops
+        .iter()
+        .map(|sample| {
+            let opaque_sample = if sample.a < 1.0 {
+                composite_over(sample, &white)
+            } else {
+                *sample
+            };
+            contrast_ratio_over_backdrop(fg, bg, &opaque_sample)
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
 fn contrast_ratio_over_backdrop(color1: &Rgba, color2: &Rgba, backdrop: &Rgba) -> f64 {
     let bg = if color2.a < 1.0 {
         composite_over(color2, backdrop)
@@ -166,5 +194,60 @@ mod tests {
         let half_white = Rgba::new(255, 255, 255, 0.5);
         let ratio = contrast_ratio(&white, &half_white);
         assert!((ratio - 1.0).abs() < 0.01, "white on half-white: {ratio}");
+    }
+
+    #[test]
+    fn test_over_backdrops_empty_matches_default() {
+        let fg = Rgba::opaque(0, 0, 0);
+        let bg = Rgba::new(255, 255, 255, 0.5);
+        assert_eq!(
+            contrast_over_backdrops(&fg, &bg, &[]),
+            contrast_ratio(&fg, &bg)
+        );
+    }
+
+    #[test]
+    fn test_over_backdrops_takes_worst_sample() {
+        // Opaque black text on an opaque white surface: contrast is 21 regardless
+        // of backdrop, so worst-case stays 21.
+        let black = Rgba::opaque(0, 0, 0);
+        let white = Rgba::opaque(255, 255, 255);
+        let backdrops = [Rgba::opaque(0, 0, 0), Rgba::opaque(255, 255, 255)];
+        let ratio = contrast_over_backdrops(&black, &white, &backdrops);
+        assert!((ratio - 21.0).abs() < 0.1, "opaque bg ignores backdrop: {ratio}");
+    }
+
+    #[test]
+    fn test_over_backdrops_narrower_range_beats_black_white() {
+        // A near-white translucent surface (alpha 0.5) with black text.
+        // Over pure black it collapses (~5:1); over a mid-grey backdrop it stays
+        // high. A real backdrop that is never black should report better contrast
+        // than the pessimistic black/white default.
+        let black_text = Rgba::opaque(0, 0, 0);
+        let translucent_white = Rgba::new(255, 255, 255, 0.5);
+
+        let default_worst = contrast_ratio(&black_text, &translucent_white);
+        let mid_grey = Rgba::opaque(200, 200, 200);
+        let over_mid = contrast_over_backdrops(&black_text, &translucent_white, &[mid_grey]);
+
+        assert!(
+            over_mid > default_worst,
+            "narrower backdrop should beat black/white worst-case: {over_mid} vs {default_worst}"
+        );
+    }
+
+    #[test]
+    fn test_over_backdrops_composites_translucent_sample_over_white() {
+        // A translucent backdrop sample must not read darker than its opaque form.
+        let fg = Rgba::opaque(0, 0, 0);
+        let bg = Rgba::new(255, 255, 255, 0.5);
+        let translucent_sample = [Rgba::new(0, 0, 0, 0.0)]; // fully transparent → white
+        let opaque_white_sample = [Rgba::opaque(255, 255, 255)];
+        assert!(
+            (contrast_over_backdrops(&fg, &bg, &translucent_sample)
+                - contrast_over_backdrops(&fg, &bg, &opaque_white_sample))
+            .abs()
+                < 0.01
+        );
     }
 }

@@ -8,7 +8,9 @@ WCAG 2.1 color contrast compliance checker for frontend projects. Statically ana
 - Scans TSX/JSX components for foreground/background color pairs via AST parsing
 - Resolves Tailwind classes, CSS variables, inline styles, and the default Tailwind v3 palette
 - Builds a cross-file component graph to detect inherited background colors
-- Supports hex, rgb, hsl, oklch, named colors, and CSS variable references
+- Composites translucent surfaces (frosted "glass" over a wallpaper/mesh) over a configured backdrop, reporting the worst-case contrast across the backdrop's luminance range
+- Extracts `hover:` / `focus:` / `focus-visible:` states as distinct pairs, so state-only contrast regressions are caught
+- Supports hex, rgb, hsl, oklch (incl. alpha), named colors, and CSS variable references
 - Checks both light and dark themes
 
 ## Install the CLI
@@ -33,7 +35,39 @@ wcag-doctor --system --css src/app/globals.css --json
 
 # Check only dark theme at AAA level
 wcag-doctor --system --css src/app/globals.css --theme dark --level aaa
+
+# Audit translucent surfaces over a backdrop (config auto-detected, or --config)
+wcag-doctor --system --css src/app/globals.css --config wcag-doctor.json5
 ```
+
+## Backdrop & surface config (optional)
+
+Translucent surfaces do not sit on a token — they sit on whatever renders behind
+them (a wallpaper, gradient, or animated mesh). Their real contrast depends on
+that backdrop, so it cannot be read from the token alone. Declare it in a
+`wcag-doctor.json5` at the project root (auto-detected) or pass `--config`:
+
+```json5
+{
+  // Backdrop sample colors per theme: literal colors or var(--token) references.
+  // A pair passes only if it clears the worst sample (a moving backdrop must
+  // read at every point).
+  backdrops: {
+    light: ["var(--mesh-1)", "var(--mesh-2)", "#204050"],
+    dark: ["var(--mesh-1)", "var(--mesh-2)"],
+  },
+  // Translucent surfaces the --x/--x-foreground convention does not pair, plus
+  // the foreground tokens placed on them. Composited over the backdrop unless
+  // `over_backdrop: false`.
+  surfaces: [
+    { background: "--glass-surface", foregrounds: ["--foreground", "--muted-foreground"] },
+    { background: "--glass-field", foregrounds: ["--foreground"] },
+  ],
+}
+```
+
+Without a config file, behavior is unchanged: a translucent surface with an
+unknown backdrop is evaluated over black and white, worst-case.
 
 ## Install as a Claude skill
 

@@ -13,6 +13,38 @@ use crate::resolver::tailwind::{
     TailwindColorConfig, parse_utility_class, resolve_tailwind_color,
 };
 
+/// Background name used when a foreground has no surface anywhere in scope: the
+/// text renders directly on the page backdrop. Emitted with a fully transparent
+/// background so backdrop resolution composites it to the real backdrop color.
+/// Dropped by the caller when no backdrop is configured, since the contrast is
+/// then unknowable rather than failing.
+pub const BACKDROP_BACKGROUND: &str = "<backdrop>";
+
+/// Background name marking "a surface component provides the background here".
+/// Its color is unknown at the usage site (the component carries its own classes),
+/// so pairs against it are not emitted — but its presence correctly prevents
+/// descendants from being reported as sitting on the backdrop.
+const SURFACE_BACKGROUND: &str = "<surface>";
+
+/// Components that render their own surface. Their usage sites carry no `bg-*`
+/// utility, so without this the scanner would treat everything inside a `<Card>`
+/// or dialog as having no background at all.
+const SURFACE_COMPONENTS: &[&str] = &[
+    "Card",
+    "DialogContent",
+    "AlertDialogContent",
+    "SheetContent",
+    "DrawerContent",
+    "PopoverContent",
+    "DropdownMenuContent",
+    "ContextMenuContent",
+    "MenubarContent",
+    "SelectContent",
+    "HoverCardContent",
+    "TooltipContent",
+    "CommandDialog",
+];
+
 /// A detected color pair within a component.
 #[derive(Debug)]
 pub struct ColorPair {
@@ -901,6 +933,15 @@ fn process_jsx_element(
         }
     }
 
+    // A surface component (Card, DialogContent, …) supplies a background even
+    // though its usage site carries no `bg-*` utility. Record it so descendants
+    // are not misreported as sitting directly on the backdrop.
+    if elem_colors.backgrounds.is_empty() && SURFACE_COMPONENTS.contains(&element_name.as_str()) {
+        elem_colors
+            .backgrounds
+            .push((SURFACE_BACKGROUND.to_string(), Rgba::opaque(128, 128, 128)));
+    }
+
     // Determine the effective backgrounds for this element and its children.
     // If this element defines its own backgrounds, those take precedence.
     // Otherwise, inherit from the parent.
@@ -911,11 +952,20 @@ fn process_jsx_element(
     };
 
     // Generate pairs: foregrounds on this element vs. effective backgrounds
-    // (own backgrounds if present, otherwise inherited from parent)
-    let bg_source = if !elem_colors.backgrounds.is_empty() {
+    // (own backgrounds if present, otherwise inherited from parent).
+    //
+    // With neither, the text has no surface anywhere in scope — it renders on
+    // whatever the page backdrop is. Pair it against a fully transparent sentinel
+    // so the backdrop resolution downstream composites it to the real backdrop
+    // (a transparent background over a backdrop sample *is* that sample). Without
+    // this, such text was silently skipped and its contrast never checked.
+    let backdrop_bg = [(BACKDROP_BACKGROUND.to_string(), Rgba::new(0, 0, 0, 0.0))];
+    let bg_source: &[(String, Rgba)] = if !elem_colors.backgrounds.is_empty() {
         &elem_colors.backgrounds
-    } else {
+    } else if !inherited_bg.is_empty() {
         inherited_bg
+    } else {
+        &backdrop_bg
     };
 
     let theme_label = theme.label().to_string();
@@ -940,6 +990,12 @@ fn emit_element_pairs(
     pairs: &mut Vec<ColorPair>,
 ) {
     let mut push = |fg: &(String, Rgba), bg: &(String, Rgba), state: &str| {
+        // A surface component's color is not knowable at the usage site; it only
+        // establishes that the text is surfaced. Emitting a pair here would report
+        // a fabricated ratio.
+        if bg.0 == SURFACE_BACKGROUND {
+            return;
+        }
         let ratio = contrast_ratio(&fg.1, &bg.1);
         pairs.push(ColorPair {
             foreground_name: fg.0.clone(),
@@ -1839,5 +1895,106 @@ mod tests {
             "ghost variant hover pair missing"
         );
         assert!(pairs.iter().all(|p| p.element == "cva"));
+    }
+
+    #[test]
+    fn test_text_without_surface_pairs_against_backdrop() {
+        // A page heading with no background anywhere in scope renders on the page
+        // backdrop. It must be reported, not silently skipped.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("header.tsx");
+        let source = r#"
+            export function Header() {
+                return <h1 className="text-white">Title</h1>;
+            }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Light,
+        );
+
+        let pair = pairs
+            .iter()
+            .find(|p| p.background_name == BACKDROP_BACKGROUND)
+            .expect("unsurfaced text should pair against the backdrop");
+        assert_eq!(pair.foreground_name, "text-white");
+        assert!(
+            pair.background_color.a < 1.0,
+            "sentinel must be transparent so backdrop resolution yields the backdrop itself"
+        );
+    }
+
+    #[test]
+    fn test_text_with_surface_does_not_use_backdrop() {
+        // Control: an inherited background means the text is surfaced, so no
+        // backdrop finding should be produced.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("surfaced.tsx");
+        let source = r#"
+            export function Surfaced() {
+                return (
+                    <div className="bg-white">
+                        <h1 className="text-black">Title</h1>
+                    </div>
+                );
+            }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Light,
+        );
+
+        assert!(
+            pairs
+                .iter()
+                .all(|p| p.background_name != BACKDROP_BACKGROUND),
+            "surfaced text must not be reported against the backdrop"
+        );
+        assert!(pairs.iter().any(|p| p.background_name == "bg-white"));
+    }
+
+    #[test]
+    fn test_surface_component_prevents_backdrop_finding() {
+        // `<Card>` carries its background inside the component, so the usage site
+        // has no `bg-*` utility. Text inside it is surfaced and must not be
+        // reported against the backdrop (nor given a fabricated ratio).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("carded.tsx");
+        let source = r#"
+            export function Carded() {
+                return (
+                    <Card>
+                        <h1 className="text-white">Title</h1>
+                    </Card>
+                );
+            }
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Light,
+        );
+
+        assert!(
+            pairs
+                .iter()
+                .all(|p| p.background_name != BACKDROP_BACKGROUND),
+            "text inside a surface component must not be reported as on the backdrop"
+        );
+        assert!(
+            pairs.is_empty(),
+            "no fabricated ratio for an unknown surface color, got {pairs:?}"
+        );
     }
 }

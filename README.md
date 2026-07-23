@@ -10,6 +10,7 @@ WCAG 2.1 color contrast compliance checker for frontend projects. Statically ana
 - Builds a cross-file component graph to detect inherited background colors
 - Composites translucent surfaces (frosted "glass" over a wallpaper/mesh) over a configured backdrop, reporting the worst-case contrast across the backdrop's luminance range
 - Extracts `hover:` / `focus:` / `focus-visible:` states as distinct pairs, so state-only contrast regressions are caught
+- Scans `cva()` / `tv()` variant maps, so class strings defined only in a shared component's variants are checked
 - Supports hex, rgb, hsl, oklch (incl. alpha), named colors, and CSS variable references
 - Checks both light and dark themes
 

@@ -91,6 +91,8 @@ The component scanner:
 - Extracts inline style colors (backgroundColor, color, fill)
 - Detects foreground/background pairs on the same element
 - Extracts `hover:` / `focus:` / `focus-visible:` states as separate pairs (reported via the `state` field): a state's utilities override the base, and unchanged properties carry over, matching how `:hover`/`:focus` cascade
+- Scans `cva()` / `tv()` (class-variance-authority / tailwind-variants) variant maps: each variant's class string is checked independently, so pairs defined only in a shared component's variants (e.g. a Button's `hover:` classes) are caught even without a JSX element
+- Composites translucent component backgrounds over the configured backdrop (same model as `--system`) when a config is present, instead of the black/white worst-case
 - Builds a cross-file component graph to detect inherited background colors
 - Resolves `tsconfig.json` / `jsconfig.json` path aliases such as `@/` and `~/`
 
@@ -205,6 +207,5 @@ OPTIONS:
 - Dynamic/computed runtime classes cannot always be resolved statically
 - Tailwind v4 projects are detected, but the built-in fallback palette is still v3-oriented
 - Static analysis can miss runtime-only theme or state combinations that are not present in source
-- Class strings inside `cva()`/`tv()` variant maps are not yet scanned, so states defined only in a variant definition (e.g. a shared Button's `hover:` classes) are not caught at the component level
-- The component scanner evaluates a translucent background over black/white worst-case; only the `--system` audit composites translucent surfaces over the configured backdrop
-- Non-text contrast (WCAG SC 1.4.11, 3:1 for UI components, borders, and adjacent surfaces) is not modeled separately — border/ring pairs are reported at the text threshold (see the border-failures note above)
+- `cva()`/`tv()` strings are scanned per-string: a pair split across the base string and a separate variant string (base sets the foreground, a variant sets the background) is not combined, since which variants apply together is a runtime decision
+- Non-text contrast (WCAG SC 1.4.11, 3:1 for UI components, borders, and adjacent surfaces) is not modeled separately — border/ring pairs are reported at the text threshold (see the border-failures note above). Flagging adjacent surface-vs-surface pairs would require detecting whether a visual boundary (border, shadow, spacing) exists, which static class analysis cannot do reliably

@@ -801,6 +801,12 @@ fn walk_expr(
             }
         },
         Expr::Call(call) => {
+            // `cva(...)` / `tv(...)` variant maps hold class strings in object/array
+            // literals that the generic arg walk does not reach. Scan each string
+            // independently — a variant's classes co-occur, different variants do not.
+            if is_variant_factory_call(call) {
+                scan_variant_factory_call(call, source, tw_config, vars, file, pairs, theme);
+            }
             if let Callee::Expr(callee) = &call.callee {
                 walk_expr(callee, source, tw_config, vars, file, pairs, inherited_bg, theme);
             }
@@ -913,34 +919,52 @@ fn process_jsx_element(
     };
 
     let theme_label = theme.label().to_string();
+    emit_element_pairs(&elem_colors, bg_source, file, &theme_label, pairs);
 
-    for (fg_name, fg_color) in &elem_colors.foregrounds {
-        for (bg_name, bg_color) in bg_source {
-            let ratio = contrast_ratio(fg_color, bg_color);
-            let level = ConformanceLevel::from_ratio(ratio);
-            pairs.push(ColorPair {
-                foreground_name: fg_name.clone(),
-                foreground_color: *fg_color,
-                background_name: bg_name.clone(),
-                background_color: *bg_color,
-                ratio,
-                level,
-                file: file.to_string(),
-                line: elem_colors.line,
-                element: elem_colors.element_name.clone(),
-                theme: theme_label.clone(),
-                state: InteractionState::Base.label().to_string(),
-            });
+    // Recurse into children with the effective background context
+    for child in &element.children {
+        walk_jsx_child(child, source, tw_config, vars, file, pairs, &effective_bg, theme);
+    }
+}
+
+/// Emit base + interaction-state contrast pairs for one element's collected colors.
+///
+/// The resting state pairs each foreground against `bg_source`. Each interaction
+/// state overrides the base per the CSS cascade: a state's own foreground/background
+/// wins, and any property it does not change carries over from the base.
+fn emit_element_pairs(
+    elem: &ElementColors,
+    bg_source: &[(String, Rgba)],
+    file: &str,
+    theme_label: &str,
+    pairs: &mut Vec<ColorPair>,
+) {
+    let mut push = |fg: &(String, Rgba), bg: &(String, Rgba), state: &str| {
+        let ratio = contrast_ratio(&fg.1, &bg.1);
+        pairs.push(ColorPair {
+            foreground_name: fg.0.clone(),
+            foreground_color: fg.1,
+            background_name: bg.0.clone(),
+            background_color: bg.1,
+            ratio,
+            level: ConformanceLevel::from_ratio(ratio),
+            file: file.to_string(),
+            line: elem.line,
+            element: elem.element_name.clone(),
+            theme: theme_label.to_string(),
+            state: state.to_string(),
+        });
+    };
+
+    for fg in &elem.foregrounds {
+        for bg in bg_source {
+            push(fg, bg, InteractionState::Base.label());
         }
     }
 
-    // Interaction states (hover/focus): the state's utilities override the base,
-    // and unchanged properties keep their base value — exactly how `:hover`/`:focus`
-    // cascade. A state that only changes the background pairs the base foreground
-    // against the new background (and vice versa).
-    for layer in &elem_colors.state_layers {
+    for layer in &elem.state_layers {
         let state_fgs: &[(String, Rgba)] = if layer.foregrounds.is_empty() {
-            &elem_colors.foregrounds
+            &elem.foregrounds
         } else {
             &layer.foregrounds
         };
@@ -949,31 +973,94 @@ fn process_jsx_element(
         } else {
             &layer.backgrounds
         };
-
-        for (fg_name, fg_color) in state_fgs {
-            for (bg_name, bg_color) in state_bgs {
-                let ratio = contrast_ratio(fg_color, bg_color);
-                let level = ConformanceLevel::from_ratio(ratio);
-                pairs.push(ColorPair {
-                    foreground_name: fg_name.clone(),
-                    foreground_color: *fg_color,
-                    background_name: bg_name.clone(),
-                    background_color: *bg_color,
-                    ratio,
-                    level,
-                    file: file.to_string(),
-                    line: elem_colors.line,
-                    element: elem_colors.element_name.clone(),
-                    theme: theme_label.clone(),
-                    state: layer.state.label().to_string(),
-                });
+        for fg in state_fgs {
+            for bg in state_bgs {
+                push(fg, bg, layer.state.label());
             }
         }
     }
+}
 
-    // Recurse into children with the effective background context
-    for child in &element.children {
-        walk_jsx_child(child, source, tw_config, vars, file, pairs, &effective_bg, theme);
+/// Whether a call is a class-variant factory (`cva(...)` or `tv(...)`) whose
+/// arguments hold Tailwind class strings in object/array literals.
+fn is_variant_factory_call(call: &CallExpr) -> bool {
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    matches!(&**callee, Expr::Ident(ident) if matches!(ident.sym.as_str(), "cva" | "tv"))
+}
+
+/// Scan a `cva()`/`tv()` call: each class string literal is scanned independently
+/// (a variant's classes co-occur; separate variants are mutually exclusive), so
+/// within-string foreground/background pairs — including `hover:`/`focus:` states —
+/// are detected even though the classes never appear on a JSX element directly.
+fn scan_variant_factory_call(
+    call: &CallExpr,
+    source: &str,
+    tw_config: &TailwindColorConfig,
+    vars: &HashMap<String, Rgba>,
+    file: &str,
+    pairs: &mut Vec<ColorPair>,
+    theme: Theme,
+) {
+    let theme_label = theme.label().to_string();
+    let mut strings: Vec<(String, usize)> = Vec::new();
+    for arg in &call.args {
+        collect_class_string_literals(&arg.expr, source, &mut strings);
+    }
+
+    for (class_str, line) in strings {
+        let mut elem = ElementColors {
+            line,
+            element_name: "cva".to_string(),
+            ..Default::default()
+        };
+        extract_colors_from_classes(&class_str, tw_config, vars, &mut elem, theme);
+        // A cva string is self-contained: its own backgrounds are the only context.
+        let bg_source = elem.backgrounds.clone();
+        emit_element_pairs(&elem, &bg_source, file, &theme_label, pairs);
+    }
+}
+
+/// Collect string-literal class sources (with their line numbers) from a `cva`/`tv`
+/// argument, descending through array and object-value literals.
+fn collect_class_string_literals(expr: &Expr, source: &str, out: &mut Vec<(String, usize)>) {
+    match expr {
+        Expr::Lit(Lit::Str(s)) => {
+            let line = byte_offset_to_line(source, s.span.lo.0 as usize);
+            out.push((wtf8_to_string(s), line));
+        }
+        Expr::Tpl(tpl) => {
+            let text = extract_strings_from_expr(expr);
+            if !text.trim().is_empty() {
+                let line = byte_offset_to_line(source, tpl.span.lo.0 as usize);
+                out.push((text, line));
+            }
+        }
+        Expr::Array(arr) => {
+            for elem in arr.elems.iter().flatten() {
+                collect_class_string_literals(&elem.expr, source, out);
+            }
+        }
+        Expr::Object(obj) => {
+            for prop in &obj.props {
+                if let PropOrSpread::Prop(prop) = prop {
+                    if let Prop::KeyValue(kv) = &**prop {
+                        collect_class_string_literals(&kv.value, source, out);
+                    }
+                }
+            }
+        }
+        Expr::Paren(p) => collect_class_string_literals(&p.expr, source, out),
+        Expr::Cond(cond) => {
+            collect_class_string_literals(&cond.cons, source, out);
+            collect_class_string_literals(&cond.alt, source, out);
+        }
+        Expr::Bin(bin) => {
+            collect_class_string_literals(&bin.left, source, out);
+            collect_class_string_literals(&bin.right, source, out);
+        }
+        _ => {}
     }
 }
 
@@ -1710,5 +1797,47 @@ mod tests {
             .expect("hover pair present");
         assert_eq!(hover.foreground_name, "text-white");
         assert_eq!(hover.background_name, "bg-blue-500");
+    }
+
+    #[test]
+    fn test_cva_variant_strings_are_scanned() {
+        // Class strings live only in a cva() variant map (no JSX element), yet the
+        // base and hover pairs inside each variant string must still be found.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("button.tsx");
+        let source = r#"
+            const button = cva("inline-flex text-sm", {
+                variants: {
+                    variant: {
+                        solid: "bg-blue-500 text-white",
+                        ghost: "hover:bg-blue-500 hover:text-white",
+                    },
+                },
+            });
+        "#;
+        fs::write(&path, source).unwrap();
+
+        let pairs = scan_component(
+            &path,
+            &TailwindColorConfig::default(),
+            &ResolvedVarColors::default(),
+            Theme::Light,
+        );
+
+        // The solid variant is a resting-state pair.
+        assert!(
+            pairs.iter().any(|p| p.state == "base"
+                && p.foreground_name == "text-white"
+                && p.background_name == "bg-blue-500"),
+            "solid variant base pair missing"
+        );
+        // The ghost variant only sets colors on hover.
+        assert!(
+            pairs.iter().any(|p| p.state == "hover"
+                && p.foreground_name == "text-white"
+                && p.background_name == "bg-blue-500"),
+            "ghost variant hover pair missing"
+        );
+        assert!(pairs.iter().all(|p| p.element == "cva"));
     }
 }

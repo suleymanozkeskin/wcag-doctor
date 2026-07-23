@@ -6,7 +6,8 @@ use rayon::prelude::*;
 
 use wcag_doctor::audit::design_system::audit_design_system;
 use wcag_doctor::config::{TailwindVersion, detect_project, is_excluded_path};
-use wcag_doctor::contrast::levels::MinimumLevel;
+use wcag_doctor::contrast::levels::{ConformanceLevel, MinimumLevel};
+use wcag_doctor::contrast::wcag::contrast_over_backdrops;
 use wcag_doctor::report::json::build_json_report;
 use wcag_doctor::report::terminal::{print_component_report, print_design_system_report};
 use wcag_doctor::resolver::css_vars::{
@@ -320,6 +321,28 @@ fn main() {
         }
 
         component_pairs = dedup_color_pairs(component_pairs);
+    }
+
+    // A component pair with a translucent background is scanned with a black/white
+    // worst-case (the scanner has no backdrop context). Recompute those over the
+    // theme's configured backdrop so component findings match the --system audit.
+    if !light_backdrops.is_empty() || !dark_backdrops.is_empty() {
+        for pair in &mut component_pairs {
+            if pair.background_color.a >= 1.0 {
+                continue;
+            }
+            let backdrops = if pair.theme == "dark" {
+                &dark_backdrops
+            } else {
+                &light_backdrops
+            };
+            if backdrops.is_empty() {
+                continue;
+            }
+            pair.ratio =
+                contrast_over_backdrops(&pair.foreground_color, &pair.background_color, backdrops);
+            pair.level = ConformanceLevel::from_ratio(pair.ratio);
+        }
     }
 
     // Output results

@@ -15,7 +15,9 @@ use wcag_doctor::resolver::css_vars::{
     load_css_vars_from_file_with_diagnostics, resolve_var_colors,
 };
 use wcag_doctor::resolver::tailwind::{TailwindColorConfig, parse_tailwind_config};
-use wcag_doctor::scanner::component::{ColorPair, Theme, dedup_color_pairs, scan_component};
+use wcag_doctor::scanner::component::{
+    BACKDROP_BACKGROUND, ColorPair, Theme, dedup_color_pairs, scan_component,
+};
 use wcag_doctor::scanner::graph::build_component_graph;
 use wcag_doctor::scanner::propagation::propagate_and_check;
 use wcag_doctor::wcag_config;
@@ -323,9 +325,18 @@ fn main() {
         component_pairs = dedup_color_pairs(component_pairs);
     }
 
+    // Text with no surface in scope is reported against `<backdrop>`. That is only
+    // meaningful when the project declared what the backdrop is; otherwise the
+    // contrast is unknowable, so drop those rather than report a guess.
+    if light_backdrops.is_empty() && dark_backdrops.is_empty() {
+        component_pairs.retain(|p| p.background_name != BACKDROP_BACKGROUND);
+    }
+
     // A component pair with a translucent background is scanned with a black/white
     // worst-case (the scanner has no backdrop context). Recompute those over the
     // theme's configured backdrop so component findings match the --system audit.
+    // This also resolves `<backdrop>` pairs: a transparent background composited
+    // over a backdrop sample is that sample, i.e. text directly on the wallpaper.
     if !light_backdrops.is_empty() || !dark_backdrops.is_empty() {
         for pair in &mut component_pairs {
             if pair.background_color.a >= 1.0 {
